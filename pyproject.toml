@@ -1,0 +1,38 @@
+[project]
+name = "nuocode"
+version = "0.1.0"
+description = "A Claude Code-style terminal AI agent (chap02: multi-protocol LLM chat client)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=0.80",
+    "rich>=13",
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "pyyaml>=6",
+]
+
+[project.scripts]
+nuocode = "nuocode.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nuocode"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
