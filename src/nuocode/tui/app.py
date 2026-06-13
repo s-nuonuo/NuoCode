@@ -14,14 +14,18 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from nuocode import __version__
+from nuocode.agent import Agent, Phase
 from nuocode.config import ProviderConfig
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, new_provider
 from nuocode.prompt import render_banner
+from nuocode.tool import Registry
 from nuocode.tui.view import (
     assistant_block,
     error_block,
     status_line,
+    tool_line,
+    tool_result_summary,
     user_block,
 )
 
@@ -96,14 +100,21 @@ class NuoCodeApp(App):
         Binding("ctrl+c", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        registry: Registry,
+    ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
+        self.registry: Registry = registry
         self.provider: Provider | None = None
+        self.agent: Agent | None = None
         self.conv: Conversation = Conversation()
         self.state: SessionState = SessionState.IDLE
         self.cur_reply: str = ""
         self.turn_start: float = 0.0
+        self._executing_tool: str | None = None
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
 
@@ -148,6 +159,7 @@ class NuoCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
+        self.agent = Agent(self.provider, self.registry)
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:
@@ -190,7 +202,7 @@ class NuoCodeApp(App):
         if text.strip() == "/exit":
             self.exit()
             return
-        if self.provider is None:
+        if self.agent is None:
             return
 
         log = self.query_one("#log", RichLog)
@@ -198,11 +210,12 @@ class NuoCodeApp(App):
         self.conv.add_user(text)
 
         self.cur_reply = ""
+        self._executing_tool = None
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
         self._timer = self.set_interval(0.1, self._tick)
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
 
     def _tick(self) -> None:
         if self.state is SessionState.STREAMING:
@@ -212,16 +225,35 @@ class NuoCodeApp(App):
         elapsed = max(0, int(time.monotonic() - self.turn_start))
         body = self.cur_reply if self.cur_reply else ""
         prefix = "● "
-        footer = f"\n\n[Imagining… ({elapsed}s)]"
+        if self._executing_tool:
+            label = f"Running {self._executing_tool}… ({elapsed}s)"
+        else:
+            label = f"Imagining… ({elapsed}s)"
+        footer = f"\n\n[{label}]"
         self.query_one("#streaming", Static).update(f"{prefix}{body}{footer}")
 
-    async def _consume_stream(self) -> None:
-        assert self.provider is not None
+    async def _consume_agent_events(self) -> None:
+        assert self.agent is not None
+        log = self.query_one("#log", RichLog)
         try:
-            async for ev in self.provider.stream(self.conv.messages()):
+            async for ev in self.agent.run(self.conv):
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
                     return
+                if ev.tool is not None:
+                    if ev.tool.phase is Phase.START:
+                        # 冻结当前文本到滚动区，接下来的文本清空后重新累计
+                        if self.cur_reply.strip():
+                            log.write(assistant_block(self.cur_reply))
+                            self.cur_reply = ""
+                        log.write(tool_line(ev.tool.name, ev.tool.args))
+                        self._executing_tool = ev.tool.name
+                        self._refresh_streaming_view()
+                    else:  # END
+                        log.write(tool_result_summary(ev.tool.result, ev.tool.is_error))
+                        self._executing_tool = None
+                        self._refresh_streaming_view()
+                    continue
                 if ev.text:
                     self.cur_reply += ev.text
                     self._refresh_streaming_view()
@@ -235,11 +267,9 @@ class NuoCodeApp(App):
 
     def _finish_with_assistant(self, reply: str) -> None:
         log = self.query_one("#log", RichLog)
-        if reply:
+        if reply.strip():
             log.write(assistant_block(reply))
-            self.conv.add_assistant(reply)
-        else:
-            log.write(error_block(RuntimeError("(empty reply)")))
+        # 历史由 Agent 自己写入 conversation，这里不重复追加。
         self._reset_streaming()
 
     def _finish_with_error(self, err: BaseException) -> None:
@@ -252,6 +282,7 @@ class NuoCodeApp(App):
             self._timer = None
         self._stream_task = None
         self.cur_reply = ""
+        self._executing_tool = None
         self.query_one("#streaming", Static).update("")
         self.state = SessionState.IDLE
         self.query_one("#input", _ChatInput).focus()

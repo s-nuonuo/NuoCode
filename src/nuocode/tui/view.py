@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
@@ -33,3 +34,32 @@ def status_line(provider_name: str, model: str, width: int = 80) -> RenderableTy
         Text(model, style="dim"),
     )
     return table
+
+
+# ───────── chap03 工具行 ─────────
+
+
+def tool_line(name: str, args: str) -> RenderableType:
+    """工具调用行：``● name(args)``，Claude Code 风格。"""
+    return Text.assemble(
+        ("● ", "bold cyan"),
+        (f"{name}", "bold"),
+        ("(", "dim"),
+        (args, "dim"),
+        (")", "dim"),
+    )
+
+
+def tool_result_summary(result: str, is_error: bool, max_lines: int = 8) -> RenderableType:
+    """工具结果摘要：缩进 + ⎿ 前缀；UI 截断到 ``max_lines`` 行。"""
+    lines = result.splitlines() if result else ["(empty)"]
+    truncated = False
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    body = "\n".join(lines)
+    if truncated:
+        body += "\n…"
+    style = "red" if is_error else "dim"
+    text = Text("⎿ " + body, style=style)
+    return Padding(text, (0, 0, 0, 2))

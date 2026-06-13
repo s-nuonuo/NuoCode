@@ -15,9 +15,11 @@ def main() -> None:
         sys.exit(1)
 
     # 延迟导入 textual：让配置错误更快返回，并避免无配置时强行加载 TUI 依赖。
+    from nuocode.tool import new_default_registry
     from nuocode.tui.app import NuoCodeApp
 
-    app = NuoCodeApp(cfg.providers)
+    registry = new_default_registry()
+    app = NuoCodeApp(cfg.providers, registry)
     try:
         app.run()
     except KeyboardInterrupt:
