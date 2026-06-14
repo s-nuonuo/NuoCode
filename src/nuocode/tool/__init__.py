@@ -25,7 +25,12 @@ class Result:
 
 @runtime_checkable
 class Tool(Protocol):
-    """统一工具抽象（F1）。"""
+    """统一工具抽象（F1）。
+
+    ``read_only``：True 表示只读工具（可并发执行 & Plan Mode 放行）。
+    """
+
+    read_only: bool
 
     def name(self) -> str: ...
 
@@ -82,6 +87,23 @@ class Registry:
             )
             for n in self._order
         ]
+
+    def read_only_definitions(self) -> list[ToolDefinition]:
+        """Plan Mode：只导出 read_only==True 的工具定义，保留注册顺序。"""
+        return [
+            ToolDefinition(
+                name=n,
+                description=self._tools[n].description(),
+                input_schema=self._tools[n].parameters(),
+            )
+            for n in self._order
+            if getattr(self._tools[n], "read_only", False)
+        ]
+
+    def is_read_only(self, name: str) -> bool:
+        """分批判定；未知工具返回 False（按串行处理）。"""
+        t = self._tools.get(name)
+        return t is not None and bool(getattr(t, "read_only", False))
 
     async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
         tool = self._tools.get(name)

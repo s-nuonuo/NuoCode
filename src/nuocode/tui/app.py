@@ -1,10 +1,11 @@
-"""nuocode Textual App：状态机 + 渲染 + 流式 + 选择。"""
+"""nuocode Textual App：状态机 + 渲染 + 流式 + 选择（chap04 Agent Loop）。"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from enum import Enum
 
 from textual.app import App, ComposeResult
@@ -14,7 +15,8 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from nuocode import __version__
-from nuocode.agent import Agent, Phase
+from nuocode import prompt as prompt_mod
+from nuocode.agent import Agent, Mode, Phase
 from nuocode.config import ProviderConfig
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, new_provider
@@ -36,6 +38,12 @@ class SessionState(Enum):
     STREAMING = "streaming"
 
 
+@dataclass
+class _ToolDisplay:
+    name: str
+    args: str
+
+
 class _ChatInput(TextArea):
     """多行输入：Enter 提交、Alt+Enter 插入换行。"""
 
@@ -48,7 +56,6 @@ class _ChatInput(TextArea):
         text = self.text
         if not text.strip():
             return
-        # 通过 App 调度 submit
         app = self.app
         if isinstance(app, NuoCodeApp):
             self.clear()
@@ -62,42 +69,19 @@ class NuoCodeApp(App):
     """nuocode 主应用。"""
 
     CSS = """
-    Screen {
-        layout: vertical;
-    }
-    #log {
-        height: 1fr;
-        border: none;
-        padding: 0 1;
-    }
-    #streaming {
-        height: auto;
-        min-height: 0;
-        padding: 0 1;
-        color: $text;
-    }
-    #input {
-        height: 5;
-        border: round $accent;
-        padding: 0 1;
-    }
-    #statusbar {
-        height: 1;
-        background: $boost;
-        padding: 0 1;
-    }
-    #select {
-        height: 1fr;
-        border: round $accent;
-        padding: 1 2;
-    }
-    .hidden {
-        display: none;
-    }
+    Screen { layout: vertical; }
+    #log { height: 1fr; border: none; padding: 0 1; }
+    #streaming { height: auto; min-height: 0; padding: 0 1; color: $text; }
+    #input { height: 5; border: round $accent; padding: 0 1; }
+    #statusbar { height: 1; background: $boost; padding: 0 1; }
+    #select { height: 1fr; border: round $accent; padding: 1 2; }
+    .hidden { display: none; }
     """
 
+    # ctrl+c / escape 自定义处理（不直接绑定 quit）
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("ctrl+c", "ctrl_c", "Quit/Cancel", priority=True),
+        Binding("escape", "esc", "Cancel", priority=True, show=False),
     ]
 
     def __init__(
@@ -114,16 +98,21 @@ class NuoCodeApp(App):
         self.state: SessionState = SessionState.IDLE
         self.cur_reply: str = ""
         self.turn_start: float = 0.0
-        self._executing_tool: str | None = None
+        self.cur_tools: list[_ToolDisplay] = []
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
+        # chap04
+        self.mode: Mode = Mode.NORMAL
+        self.iter: int = 0
+        self.usage_in: int = 0
+        self.usage_out: int = 0
+        self.turn_cancel: asyncio.Event | None = None
 
     # ───────── compose ─────────
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="log", wrap=True, markup=False, highlight=False)
         yield Static("", id="streaming")
-        # 选择列表（多 provider 时使用）
         options = [
             Option(f"{p.name}  ({p.model})", id=str(i)) for i, p in enumerate(self.providers)
         ]
@@ -167,7 +156,15 @@ class NuoCodeApp(App):
         if self.provider is None:
             bar.update("")
             return
-        bar.update(status_line(self.provider.name, self.provider.model))
+        bar.update(
+            status_line(
+                self.provider.name,
+                self.provider.model,
+                plan_mode=(self.mode == Mode.PLAN),
+                usage_in=self.usage_in,
+                usage_out=self.usage_out,
+            )
+        )
 
     def _enter_idle(self) -> None:
         self.state = SessionState.IDLE
@@ -196,22 +193,38 @@ class NuoCodeApp(App):
     # ───────── submit / streaming ─────────
 
     def post_submit(self, text: str) -> None:
-        """从 _ChatInput 调度的入口（同步）。"""
         if self.state is not SessionState.IDLE:
             return
-        if text.strip() == "/exit":
+        stripped = text.strip()
+        if stripped == "/exit":
             self.exit()
             return
         if self.agent is None:
             return
 
         log = self.query_one("#log", RichLog)
-        log.write(user_block(text))
-        self.conv.add_user(text)
 
+        if stripped == "/plan":
+            self.mode = Mode.PLAN
+            log.write("● 已进入计划模式（仅只读工具）。用 /do 切回并执行。")
+            self._refresh_statusbar()
+            return
+        if stripped == "/do":
+            self.mode = Mode.NORMAL
+            self.conv.add_user(prompt_mod.EXECUTE_DIRECTIVE)
+            log.write(user_block(prompt_mod.EXECUTE_DIRECTIVE))
+        else:
+            log.write(user_block(text))
+            self.conv.add_user(text)
+
+        self._start_turn()
+
+    def _start_turn(self) -> None:
         self.cur_reply = ""
-        self._executing_tool = None
+        self.cur_tools = []
+        self.iter = 0
         self.turn_start = time.monotonic()
+        self.turn_cancel = asyncio.Event()
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
         self._timer = self.set_interval(0.1, self._tick)
@@ -225,10 +238,12 @@ class NuoCodeApp(App):
         elapsed = max(0, int(time.monotonic() - self.turn_start))
         body = self.cur_reply if self.cur_reply else ""
         prefix = "● "
-        if self._executing_tool:
-            label = f"Running {self._executing_tool}… ({elapsed}s)"
+        if self.cur_tools:
+            lines = [f"[{i + 1}] Running {t.name}({t.args})…" for i, t in enumerate(self.cur_tools)]
+            label = "\n".join(lines) + f"\n({elapsed}s · 第 {self.iter} 轮)"
         else:
-            label = f"Imagining… ({elapsed}s)"
+            extra = f" · 第 {self.iter} 轮" if self.iter > 0 else ""
+            label = f"Imagining… ({elapsed}s{extra})"
         footer = f"\n\n[{label}]"
         self.query_one("#streaming", Static).update(f"{prefix}{body}{footer}")
 
@@ -236,60 +251,81 @@ class NuoCodeApp(App):
         assert self.agent is not None
         log = self.query_one("#log", RichLog)
         try:
-            async for ev in self.agent.run(self.conv):
+            assert self.turn_cancel is not None
+            async for ev in self.agent.run(self.conv, self.mode, self.turn_cancel):
                 if ev.err is not None:
-                    self._finish_with_error(ev.err)
-                    return
+                    log.write(error_block(ev.err))
+                    continue
                 if ev.tool is not None:
                     if ev.tool.phase is Phase.START:
-                        # 冻结当前文本到滚动区，接下来的文本清空后重新累计
                         if self.cur_reply.strip():
                             log.write(assistant_block(self.cur_reply))
                             self.cur_reply = ""
-                        log.write(tool_line(ev.tool.name, ev.tool.args))
-                        self._executing_tool = ev.tool.name
+                        self.cur_tools.append(_ToolDisplay(ev.tool.name, ev.tool.args))
                         self._refresh_streaming_view()
-                    else:  # END
+                    else:
+                        # FIFO 弹首
+                        if self.cur_tools:
+                            self.cur_tools.pop(0)
+                        log.write(tool_line(ev.tool.name, ev.tool.args))
                         log.write(tool_result_summary(ev.tool.result, ev.tool.is_error))
-                        self._executing_tool = None
                         self._refresh_streaming_view()
                     continue
+                if ev.usage is not None:
+                    self.usage_in += ev.usage.input
+                    self.usage_out += ev.usage.output
+                    self._refresh_statusbar()
+                if ev.notice:
+                    log.write(f"● {ev.notice}")
+                if ev.iter > 0:
+                    self.iter = ev.iter
+                    self._refresh_streaming_view()
                 if ev.text:
                     self.cur_reply += ev.text
                     self._refresh_streaming_view()
                 if ev.done:
                     self._finish_with_assistant(self.cur_reply)
                     return
+            # generator 自然结束（取消 / 出错 / 上限文案已发出，但无 done）
+            self._finish_turn()
         except asyncio.CancelledError:
+            self._finish_turn()
             raise
         except Exception as e:  # noqa: BLE001
-            self._finish_with_error(e)
+            log.write(error_block(e))
+            self._finish_turn()
 
     def _finish_with_assistant(self, reply: str) -> None:
         log = self.query_one("#log", RichLog)
         if reply.strip():
             log.write(assistant_block(reply))
-        # 历史由 Agent 自己写入 conversation，这里不重复追加。
-        self._reset_streaming()
+        self._finish_turn()
 
-    def _finish_with_error(self, err: BaseException) -> None:
-        self.query_one("#log", RichLog).write(error_block(err))
-        self._reset_streaming()
-
-    def _reset_streaming(self) -> None:
+    def _finish_turn(self) -> None:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
         self._stream_task = None
         self.cur_reply = ""
-        self._executing_tool = None
+        self.cur_tools = []
+        self.iter = 0
+        self.turn_cancel = None
         self.query_one("#streaming", Static).update("")
         self.state = SessionState.IDLE
-        self.query_one("#input", _ChatInput).focus()
+        self._refresh_statusbar()
+        try:
+            self.query_one("#input", _ChatInput).focus()
+        except Exception:  # noqa: BLE001
+            pass
 
-    # ───────── quit ─────────
+    # ───────── 按键 ─────────
 
-    async def action_quit(self) -> None:
-        if self._stream_task is not None and not self._stream_task.done():
-            self._stream_task.cancel()
+    def action_ctrl_c(self) -> None:
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()
+            return
         self.exit()
+
+    def action_esc(self) -> None:
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()

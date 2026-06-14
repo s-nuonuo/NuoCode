@@ -66,11 +66,27 @@ class Message:
 
 
 @dataclass
+class Usage:
+    """协议无关地承载一轮请求的 token 用量。
+
+    - input_tokens：本轮请求输入（含完整历史）token 数。
+    - output_tokens：本轮响应输出 token 数。
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class StreamEvent:
-    """流式事件（四态：文本增量 / 工具调用 / 正常结束 / 错误）。"""
+    """流式事件（多态：文本增量 / 工具调用 / 用量 / 正常结束 / 错误）。
+
+    ``usage`` 非空：本轮 token 用量，由适配器在 ``done`` 之前一次性发出。
+    """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
     done: bool = False
     err: Exception | None = None
 
@@ -90,8 +106,13 @@ class Provider(Protocol):
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
-        """发起一轮流式对话；``tools`` 为空表示本次不带工具。"""
+        """发起一轮流式对话。
+
+        - ``tools`` 为空表示本次不带工具。
+        - ``system_suffix`` 非空时拼接到内置 SYSTEM_PROMPT 之后（Plan Mode 计划态约束）。
+        """
         ...
 
 
@@ -117,6 +138,7 @@ __all__ = [
     "Role",
     "StreamEvent",
     "ToolCall",
+    "Usage",
     "ToolDefinition",
     "ToolResult",
     "new_provider",

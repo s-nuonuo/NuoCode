@@ -24,15 +24,33 @@ def error_block(err: BaseException) -> RenderableType:
     return Text(f"● {err}", style="bold red")
 
 
-def status_line(provider_name: str, model: str, width: int = 80) -> RenderableType:
-    """状态栏：左 provider 名、右 model 名。"""
+def _fmt_tok(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def status_line(
+    provider_name: str,
+    model: str,
+    width: int = 80,
+    plan_mode: bool = False,
+    usage_in: int = 0,
+    usage_out: int = 0,
+) -> RenderableType:
+    """状态栏：左 provider 名（+PLAN 徽标）、右 model 名 + 累计用量。"""
     table = Table.grid(expand=True)
     table.add_column(justify="left", ratio=1)
     table.add_column(justify="right", ratio=1)
-    table.add_row(
-        Text(provider_name, style="bold magenta"),
-        Text(model, style="dim"),
-    )
+    left = Text(provider_name, style="bold magenta")
+    if plan_mode:
+        left.append("  [PLAN]", style="bold yellow")
+    right = Text(f"{model}", style="dim")
+    if usage_in or usage_out:
+        right.append(f"  ↑{_fmt_tok(usage_in)} ↓{_fmt_tok(usage_out)} tok", style="dim")
+    table.add_row(left, right)
     return table
 
 

@@ -34,5 +34,9 @@ class Conversation:
         """返回历史消息的副本。"""
         return list(self._messages)
 
+    def last_role(self) -> str:
+        """返回最后一条消息的 role；空历史返回 ""。"""
+        return self._messages[-1].role if self._messages else ""
+
     def __len__(self) -> int:
         return len(self._messages)

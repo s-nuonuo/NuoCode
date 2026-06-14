@@ -10,6 +10,8 @@ from nuocode.tool import Result, _truncate
 
 
 class BashTool:
+    read_only = False
+
     def name(self) -> str:
         return "bash"
 

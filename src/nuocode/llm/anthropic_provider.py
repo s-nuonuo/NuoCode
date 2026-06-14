@@ -16,6 +16,7 @@ from nuocode.llm import (
     StreamEvent,
     ToolCall,
     ToolDefinition,
+    Usage,
 )
 from nuocode.prompt import SYSTEM_PROMPT
 
@@ -82,6 +83,12 @@ def _has_tool_history(msgs: list[Message]) -> bool:
     return False
 
 
+def _effective_system(suffix: str) -> str:
+    if suffix:
+        return SYSTEM_PROMPT + "\n\n" + suffix
+    return SYSTEM_PROMPT
+
+
 class AnthropicProvider:
     def __init__(self, cfg: ProviderConfig) -> None:
         kwargs: dict[str, object] = {"api_key": cfg.api_key}
@@ -104,12 +111,13 @@ class AnthropicProvider:
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         sdk_msgs = _to_anthropic_messages(msgs)
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT,
+            "system": _effective_system(system_suffix),
             "messages": sdk_msgs,
         }
         if tools:
@@ -147,6 +155,11 @@ class AnthropicProvider:
                         )
                 if calls:
                     yield StreamEvent(tool_calls=calls)
+            usage = getattr(final_message, "usage", None)
+            if usage is not None:
+                in_tok = getattr(usage, "input_tokens", 0) or 0
+                out_tok = getattr(usage, "output_tokens", 0) or 0
+                yield StreamEvent(usage=Usage(input_tokens=in_tok, output_tokens=out_tok))
             yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise

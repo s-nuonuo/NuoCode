@@ -1,23 +1,61 @@
-"""Agent：单轮闭环编排。
+"""Agent：ReAct 循环编排（chap04）。
 
-请求#1 → 收集工具调用 → 顺序执行 → 结果回灌 → 请求#2 → 最终文本 → 停。
-请求#2 即使返回 tool_calls 也忽略（单轮上限，AC9）。
+每一轮：带工具定义发起请求 → 流式收集 → 若模型请求工具则执行并把结果回灌进历史 → 进入下一轮；
+若模型给出无工具调用的纯文本，则该文本即最终答复，循环结束。
+
+停止条件：
+- 自然完成（无工具调用）
+- 迭代上限 MAX_ITERATIONS 兜底
+- 用户取消（cancel.is_set()）
+- 连续 MAX_UNKNOWN_RUN 轮仅请求未知工具
+- provider 流出错
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, ToolCall, ToolResult
+from nuocode.prompt import PLAN_MODE_REMINDER
 from nuocode.tool import DEFAULT_TIMEOUT, Registry
+
+# ───────── 常量 ─────────
+
+MAX_ITERATIONS: int = 25
+"""迭代上限兜底（F2）。"""
+
+MAX_UNKNOWN_RUN: int = 3
+"""连续「整轮只产生未知工具调用」的迭代数上限（F2）。"""
+
+NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
+NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
+NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
+NOTICE_CANCELLED = "（已取消。）"
+
+
+# ───────── 数据结构 ─────────
 
 
 class Phase(Enum):
     START = "start"
     END = "end"
+
+
+class Mode(IntEnum):
+    NORMAL = 0
+    PLAN = 1
+
+
+@dataclass
+class Usage:
+    """一轮请求的 token 用量。"""
+
+    input: int = 0
+    output: int = 0
 
 
 @dataclass
@@ -31,17 +69,18 @@ class ToolEvent:
 
 @dataclass
 class Event:
+    """对外事件流元素。"""
+
     text: str = ""
     tool: ToolEvent | None = None
+    usage: Usage | None = None
+    iter: int = 0
+    notice: str = ""
     done: bool = False
     err: Exception | None = None
 
 
-@dataclass
-class _StreamCollect:
-    text: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    err: Exception | None = None
+# ───────── 辅助 ─────────
 
 
 def _preview_args(s: str, limit: int = 80) -> str:
@@ -52,82 +91,256 @@ def _preview_args(s: str, limit: int = 80) -> str:
     return s[: limit - 1] + "…"
 
 
+def _ensure_final(text: str) -> str:
+    if text.strip():
+        return text
+    return "（空回复）"
+
+
+# ───────── Agent ─────────
+
+
 class Agent:
-    """持有 provider 与注册中心，执行单轮闭环。"""
+    """持有 provider 与注册中心，执行 ReAct 循环。"""
 
     def __init__(self, provider: Provider, registry: Registry) -> None:
         self._provider = provider
         self._registry = registry
 
-    async def run(self, conv: Conversation) -> AsyncIterator[Event]:
-        defs = self._registry.definitions()
+    async def run(
+        self,
+        conv: Conversation,
+        mode: Mode = Mode.NORMAL,
+        cancel: asyncio.Event | None = None,
+    ) -> AsyncIterator[Event]:
+        if cancel is None:
+            cancel = asyncio.Event()
 
-        # ───────── 请求#1 ─────────
-        first = _StreamCollect()
-        async for ev in self._provider.stream(conv.messages(), defs):
-            if ev.err is not None:
-                yield Event(err=ev.err)
+        if mode == Mode.PLAN:
+            defs = self._registry.read_only_definitions()
+            suffix = PLAN_MODE_REMINDER
+        else:
+            defs = self._registry.definitions()
+            suffix = ""
+
+        unknown_run = 0
+
+        for it in range(1, MAX_ITERATIONS + 1):
+            yield Event(iter=it)
+
+            if cancel.is_set():
+                self._finish_cancelled(conv)
                 return
-            if ev.text:
-                first.text += ev.text
-                yield Event(text=ev.text)
-            if ev.tool_calls:
-                first.tool_calls.extend(ev.tool_calls)
-            if ev.done:
-                break
 
-        if not first.tool_calls:
-            # 纯文本回合：直接结束
-            conv.add_assistant(first.text)
-            yield Event(done=True)
-            return
+            text_buf: list[str] = []
+            calls_buf: list[ToolCall] = []
+            usage_buf: list[Usage] = []
+            err_holder: list[Exception] = []
 
-        # 有工具调用：把 assistant 工具回合追加到历史
-        conv.add_assistant_with_tool_calls(first.text, first.tool_calls)
+            async for ev in self._stream_once(
+                conv, defs, suffix, cancel, text_buf, calls_buf, usage_buf, err_holder
+            ):
+                yield ev
 
-        # ───────── 顺序执行工具 ─────────
-        results: list[ToolResult] = []
-        for call in first.tool_calls:
-            args_preview = _preview_args(call.input)
-            yield Event(tool=ToolEvent(name=call.name, args=args_preview, phase=Phase.START))
-            r = await self._registry.execute(call.name, call.input, timeout=DEFAULT_TIMEOUT)
-            results.append(ToolResult(tool_call_id=call.id, content=r.content, is_error=r.is_error))
-            yield Event(
-                tool=ToolEvent(
-                    name=call.name,
-                    args=args_preview,
-                    phase=Phase.END,
-                    result=r.content,
-                    is_error=r.is_error,
-                )
-            )
-
-        conv.add_tool_results(results)
-
-        # ───────── 请求#2（续答；忽略再次的工具调用） ─────────
-        second = _StreamCollect()
-        async for ev in self._provider.stream(conv.messages(), defs):
-            if ev.err is not None:
-                yield Event(err=ev.err)
+            if err_holder:
+                # 流出错：notice + 历史收尾
+                yield Event(notice=NOTICE_STREAM_ERR)
+                self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
                 return
-            if ev.text:
-                second.text += ev.text
-                yield Event(text=ev.text)
-            # 单轮：tool_calls 一律忽略
-            if ev.done:
-                break
 
-        final = second.text
-        if not final.strip():
-            final = "（已完成本轮工具调用；本章为单轮闭环，不再继续触发新工具。）"
-            yield Event(text=final)
-        conv.add_assistant(final)
+            if cancel.is_set():
+                self._finish_cancelled(conv)
+                return
+
+            text = "".join(text_buf)
+            calls = list(calls_buf)
+            usage = usage_buf[-1] if usage_buf else None
+
+            if usage is not None:
+                yield Event(usage=usage)
+
+            if not calls:
+                # 自然完成
+                conv.add_assistant(_ensure_final(text))
+                yield Event(done=True)
+                return
+
+            # 有工具调用
+            conv.add_assistant_with_tool_calls(text, calls)
+
+            # 统计未知工具
+            if self._all_unknown(calls):
+                unknown_run += 1
+            else:
+                unknown_run = 0
+
+            # 执行（保序分批）
+            results: list[ToolResult | None] = [None] * len(calls)
+            completed = True
+            async for ev in self._execute_batched(calls, cancel, results):
+                yield ev
+            # 检查是否被取消
+            if any(r is None for r in results):
+                completed = False
+                # 把未完成的位置填上「已取消」
+                for k, c in enumerate(calls):
+                    if results[k] is None:
+                        results[k] = ToolResult(
+                            tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
+                        )
+
+            real_results: list[ToolResult] = [r for r in results if r is not None]
+            conv.add_tool_results(real_results)
+
+            if not completed:
+                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+                return
+
+            if unknown_run >= MAX_UNKNOWN_RUN:
+                yield Event(notice=NOTICE_UNKNOWN_TOOLS)
+                self._ensure_assistant_tail(conv, NOTICE_UNKNOWN_TOOLS)
+                yield Event(done=True)
+                return
+
+        # 触达迭代上限
+        yield Event(notice=NOTICE_MAX_ITER)
+        self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield Event(done=True)
+
+    async def _stream_once(
+        self,
+        conv: Conversation,
+        defs,
+        suffix: str,
+        cancel: asyncio.Event,
+        text_buf: list[str],
+        calls_buf: list[ToolCall],
+        usage_buf: list[Usage],
+        err_holder: list[Exception],
+    ) -> AsyncIterator[Event]:
+        """流式收集双路：实时 yield 文本事件，攒齐 calls 与 usage。"""
+        try:
+            async for ev in self._provider.stream(conv.messages(), defs, suffix):
+                if cancel.is_set():
+                    return
+                if ev.err is not None:
+                    err_holder.append(ev.err)
+                    yield Event(err=ev.err)
+                    return
+                if ev.text:
+                    text_buf.append(ev.text)
+                    yield Event(text=ev.text)
+                if ev.tool_calls:
+                    calls_buf.extend(ev.tool_calls)
+                if ev.usage is not None:
+                    usage_buf.append(
+                        Usage(input=ev.usage.input_tokens, output=ev.usage.output_tokens)
+                    )
+                if ev.done:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            err_holder.append(e)
+            yield Event(err=e)
+
+    async def _execute_batched(
+        self,
+        calls: list[ToolCall],
+        cancel: asyncio.Event,
+        results: list[ToolResult | None],
+    ) -> AsyncIterator[Event]:
+        """保序分批：连续只读并发，有副作用串行；事件「PHASE_START 按序、PHASE_END 按序」。"""
+        i = 0
+        n = len(calls)
+        while i < n:
+            if cancel.is_set():
+                return
+            if self._registry.is_read_only(calls[i].name):
+                # 吃最长连续只读区间
+                j = i
+                while j < n and self._registry.is_read_only(calls[j].name):
+                    j += 1
+                # 区间 [i, j) 并发
+                # 先按序 yield PHASE_START
+                previews = [_preview_args(calls[k].input) for k in range(i, j)]
+                for k in range(i, j):
+                    yield Event(
+                        tool=ToolEvent(
+                            name=calls[k].name,
+                            args=previews[k - i],
+                            phase=Phase.START,
+                        )
+                    )
+                # 并发执行
+                tasks = [asyncio.create_task(self._run_one(calls[k])) for k in range(i, j)]
+                gathered = await asyncio.gather(*tasks, return_exceptions=False)
+                for offset, res in enumerate(gathered):
+                    k = i + offset
+                    results[k] = ToolResult(
+                        tool_call_id=calls[k].id, content=res.content, is_error=res.is_error
+                    )
+                # 按序 yield PHASE_END
+                for k in range(i, j):
+                    r = results[k]
+                    assert r is not None
+                    yield Event(
+                        tool=ToolEvent(
+                            name=calls[k].name,
+                            args=previews[k - i],
+                            phase=Phase.END,
+                            result=r.content,
+                            is_error=r.is_error,
+                        )
+                    )
+                i = j
+            else:
+                # 串行单个
+                preview = _preview_args(calls[i].input)
+                yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
+                res = await self._run_one(calls[i])
+                results[i] = ToolResult(
+                    tool_call_id=calls[i].id, content=res.content, is_error=res.is_error
+                )
+                yield Event(
+                    tool=ToolEvent(
+                        name=calls[i].name,
+                        args=preview,
+                        phase=Phase.END,
+                        result=res.content,
+                        is_error=res.is_error,
+                    )
+                )
+                i += 1
+
+    async def _run_one(self, call: ToolCall):
+        return await self._registry.execute(call.name, call.input, timeout=DEFAULT_TIMEOUT)
+
+    def _all_unknown(self, calls: list[ToolCall]) -> bool:
+        for c in calls:
+            if self._registry.get(c.name) is not None:
+                return False
+        return True
+
+    def _ensure_assistant_tail(self, conv: Conversation, fallback: str) -> None:
+        if conv.last_role() != "assistant":
+            conv.add_assistant(fallback)
+
+    def _finish_cancelled(self, conv: Conversation) -> None:
+        self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
 
 
 __all__ = [
+    "MAX_ITERATIONS",
+    "MAX_UNKNOWN_RUN",
+    "NOTICE_CANCELLED",
+    "NOTICE_MAX_ITER",
+    "NOTICE_STREAM_ERR",
+    "NOTICE_UNKNOWN_TOOLS",
     "Agent",
     "Event",
+    "Mode",
     "Phase",
     "ToolEvent",
+    "Usage",
 ]

@@ -10,6 +10,8 @@ from nuocode.tool import Result
 
 
 class EditFileTool:
+    read_only = False
+
     def name(self) -> str:
         return "edit_file"
 

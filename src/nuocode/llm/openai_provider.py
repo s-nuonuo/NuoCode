@@ -15,6 +15,7 @@ from nuocode.llm import (
     StreamEvent,
     ToolCall,
     ToolDefinition,
+    Usage,
 )
 from nuocode.prompt import SYSTEM_PROMPT
 
@@ -33,8 +34,9 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-def _to_openai_messages(msgs: list[Message]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _to_openai_messages(msgs: list[Message], system_suffix: str = "") -> list[dict[str, Any]]:
+    sys_text = SYSTEM_PROMPT + ("\n\n" + system_suffix if system_suffix else "")
+    out: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
     for m in msgs:
         if m.role == "user":
             out.append({"role": "user", "content": m.content})
@@ -92,12 +94,14 @@ class OpenAIProvider:
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
-        messages = _to_openai_messages(msgs)
+        messages = _to_openai_messages(msgs, system_suffix)
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = _to_openai_tools(tools)
@@ -108,8 +112,17 @@ class OpenAIProvider:
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
+                # 末尾一个 chunk.choices == [] 但带 chunk.usage（include_usage=True）
+                chunk_usage = getattr(chunk, "usage", None)
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
+                    if chunk_usage is not None:
+                        yield StreamEvent(
+                            usage=Usage(
+                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0) or 0,
+                                output_tokens=getattr(chunk_usage, "completion_tokens", 0) or 0,
+                            )
+                        )
                     continue
                 choice = choices[0]
                 delta = getattr(choice, "delta", None)

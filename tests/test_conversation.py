@@ -49,3 +49,16 @@ def test_tool_call_and_result_roundtrip() -> None:
     assert msgs[2].tool_results[0].tool_call_id == "t1"
     assert msgs[2].tool_results[0].is_error is False
     assert msgs[3].content.startswith("文件")
+
+
+def test_last_role() -> None:
+    c = Conversation()
+    assert c.last_role() == ""
+    c.add_user("hi")
+    assert c.last_role() == ROLE_USER
+    c.add_assistant_with_tool_calls("", [ToolCall(id="t1", name="x", input="{}")])
+    assert c.last_role() == ROLE_ASSISTANT
+    c.add_tool_results([ToolResult(tool_call_id="t1", content="ok")])
+    assert c.last_role() == ROLE_TOOL
+    c.add_assistant("done")
+    assert c.last_role() == ROLE_ASSISTANT
