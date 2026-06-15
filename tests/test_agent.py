@@ -13,13 +13,14 @@ from nuocode.agent import (
     MAX_UNKNOWN_RUN,
     NOTICE_MAX_ITER,
     NOTICE_UNKNOWN_TOOLS,
+    PLAN_REMINDER_INTERVAL,
     Agent,
     Mode,
     Phase,
 )
 from nuocode.conversation import Conversation
-from nuocode.llm import Message, StreamEvent, ToolCall, ToolDefinition
-from nuocode.prompt import PLAN_MODE_REMINDER
+from nuocode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition
+from nuocode.llm import Usage as LLMUsage
 from nuocode.tool import Registry, Result
 
 # ───────── Fakes ─────────
@@ -53,9 +54,7 @@ class FakeProvider:
 
     scripts: list[list[StreamEvent]] = field(default_factory=list)
     call_count: int = 0
-    captured_msgs: list[list[Message]] = field(default_factory=list)
-    captured_tools: list[list[ToolDefinition]] = field(default_factory=list)
-    captured_suffix: list[str] = field(default_factory=list)
+    captured_reqs: list[Request] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -65,20 +64,26 @@ class FakeProvider:
     def model(self) -> str:
         return "fake-model"
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         idx = self.call_count
         self.call_count += 1
-        self.captured_msgs.append(list(msgs))
-        self.captured_tools.append(list(tools))
-        self.captured_suffix.append(system_suffix)
+        self.captured_reqs.append(req)
         events = self.scripts[idx] if idx < len(self.scripts) else [StreamEvent(done=True)]
         for ev in events:
             yield ev
+
+    # 调用便捷访问
+    @property
+    def captured_msgs(self) -> list[list[Message]]:
+        return [list(r.messages) for r in self.captured_reqs]
+
+    @property
+    def captured_tools(self) -> list[list[ToolDefinition]]:
+        return [list(r.tools) for r in self.captured_reqs]
+
+    @property
+    def captured_reminders(self) -> list[str]:
+        return [r.reminder for r in self.captured_reqs]
 
 
 @dataclass
@@ -86,9 +91,7 @@ class _AlwaysToolProvider:
     """每次 stream 都返回一个 read_file 工具调用——用来触发迭代上限。"""
 
     call_count: int = 0
-    captured_msgs: list[list[Message]] = field(default_factory=list)
-    captured_tools: list[list[ToolDefinition]] = field(default_factory=list)
-    captured_suffix: list[str] = field(default_factory=list)
+    captured_reqs: list[Request] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -98,17 +101,10 @@ class _AlwaysToolProvider:
     def model(self) -> str:
         return "fake-model"
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         idx = self.call_count
         self.call_count += 1
-        self.captured_msgs.append(list(msgs))
-        self.captured_tools.append(list(tools))
-        self.captured_suffix.append(system_suffix)
+        self.captured_reqs.append(req)
         yield StreamEvent(tool_calls=[ToolCall(id=f"c{idx}", name="read_file", input="{}")])
         yield StreamEvent(done=True)
 
@@ -138,7 +134,7 @@ async def test_multi_round_loop() -> None:
     )
     conv = Conversation()
     conv.add_user("read x")
-    agent = Agent(fp, reg)
+    agent = Agent(fp, reg, "v0")
     events = [ev async for ev in agent.run(conv, Mode.NORMAL, asyncio.Event())]
 
     iters = [ev.iter for ev in events if ev.iter > 0]
@@ -163,7 +159,7 @@ async def test_pure_text_natural_finish() -> None:
     )
     conv = Conversation()
     conv.add_user("hi")
-    events = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
     assert events[-1].done is True
     assert conv.messages()[-1].content == "hello world"
     assert fp.call_count == 1
@@ -177,7 +173,7 @@ async def test_max_iterations_cap() -> None:
     fp = _AlwaysToolProvider()
     conv = Conversation()
     conv.add_user("loop")
-    events = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
     assert fp.call_count == MAX_ITERATIONS
     notices = [ev.notice for ev in events if ev.notice]
     assert NOTICE_MAX_ITER in notices
@@ -200,7 +196,7 @@ async def test_unknown_tools_run_stops() -> None:
     fp = FakeProvider(scripts=scripts)
     conv = Conversation()
     conv.add_user("call ghost")
-    events = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
     notices = [ev.notice for ev in events if ev.notice]
     assert NOTICE_UNKNOWN_TOOLS in notices
     assert fp.call_count == MAX_UNKNOWN_RUN
@@ -228,7 +224,7 @@ async def test_unknown_run_resets_on_known_tool() -> None:
     fp = FakeProvider(scripts=scripts)
     conv = Conversation()
     conv.add_user("mix")
-    events = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
     notices = [ev.notice for ev in events if ev.notice]
     assert NOTICE_UNKNOWN_TOOLS not in notices
     assert events[-1].done is True
@@ -307,7 +303,7 @@ async def test_concurrent_batch_then_serial() -> None:
     conv = Conversation()
     conv.add_user("mixed")
     t0 = asyncio.get_event_loop().time()
-    _ = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    _ = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
 
     # 两只读应并发（峰值 >=2）
     assert peak.get("max", 0) >= 2
@@ -353,7 +349,7 @@ async def test_cancel_keeps_history_consistent() -> None:
     cancel = asyncio.Event()
 
     async def runner():
-        return [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, cancel)]
+        return [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, cancel)]
 
     task = asyncio.create_task(runner())
     await asyncio.sleep(0.05)
@@ -398,8 +394,9 @@ async def test_plan_mode_only_readonly_tools() -> None:
     fp = FakeProvider(scripts=[[StreamEvent(text="计划如下：…"), StreamEvent(done=True)]])
     conv = Conversation()
     conv.add_user("plan it")
-    _ = [ev async for ev in Agent(fp, reg).run(conv, Mode.PLAN, asyncio.Event())]
-    assert fp.captured_suffix[0] == PLAN_MODE_REMINDER
+    _ = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.PLAN, asyncio.Event())]
+    assert "<system-reminder>" in fp.captured_reminders[0]
+    assert "计划模式" in fp.captured_reminders[0]
     names = [t.name for t in fp.captured_tools[0]]
     assert names == ["read_file"]
 
@@ -412,7 +409,99 @@ async def test_stream_error_recovers() -> None:
     fp = FakeProvider(scripts=[[StreamEvent(err=RuntimeError("boom"))]])
     conv = Conversation()
     conv.add_user("hi")
-    events = [ev async for ev in Agent(fp, reg).run(conv, Mode.NORMAL, asyncio.Event())]
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
     errs = [ev for ev in events if ev.err is not None]
     assert errs and isinstance(errs[0].err, RuntimeError)
     assert conv.last_role() == "assistant"
+
+
+# ───────── chap05：系统提示装配 / 按轮次 reminder / 缓存用量透传 ─────────
+
+
+async def test_request_carries_system_blocks() -> None:
+    reg, _ = _make_registry()
+    fp = FakeProvider(scripts=[[StreamEvent(text="ok"), StreamEvent(done=True)]])
+    conv = Conversation()
+    conv.add_user("hello")
+    _ = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
+    req = fp.captured_reqs[0]
+    assert req.system.stable  # 稳定段非空
+    assert req.system.environment  # 环境段非空
+    # reminder 不写入持久历史
+    assert all("<system-reminder>" not in (m.content or "") for m in conv.messages())
+
+
+async def test_stable_system_consistent_between_modes() -> None:
+    reg, _ = _make_registry()
+    # 普通模式
+    fp1 = FakeProvider(scripts=[[StreamEvent(text="a"), StreamEvent(done=True)]])
+    conv1 = Conversation()
+    conv1.add_user("x")
+    _ = [ev async for ev in Agent(fp1, reg, "v0").run(conv1, Mode.NORMAL, asyncio.Event())]
+    # 规划模式
+    fp2 = FakeProvider(scripts=[[StreamEvent(text="b"), StreamEvent(done=True)]])
+    conv2 = Conversation()
+    conv2.add_user("y")
+    _ = [ev async for ev in Agent(fp2, reg, "v0").run(conv2, Mode.PLAN, asyncio.Event())]
+    assert fp1.captured_reqs[0].system.stable == fp2.captured_reqs[0].system.stable
+
+
+async def test_plan_reminder_full_then_concise() -> None:
+    """规划模式：iter1 完整、iter2 精简（PLAN_REMINDER_INTERVAL=4）。"""
+    reg, _ = _make_registry()
+    # 让循环至少跑两轮：第一轮触发已知工具，第二轮纯文本完成
+    scripts: list[list[StreamEvent]] = [
+        [
+            StreamEvent(tool_calls=[ToolCall(id="r1", name="read_file", input="{}")]),
+            StreamEvent(done=True),
+        ],
+        [StreamEvent(text="计划如下"), StreamEvent(done=True)],
+    ]
+    fp = FakeProvider(scripts=scripts)
+    conv = Conversation()
+    conv.add_user("plan")
+    _ = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.PLAN, asyncio.Event())]
+    assert PLAN_REMINDER_INTERVAL == 4
+    r1 = fp.captured_reminders[0]
+    r2 = fp.captured_reminders[1]
+    assert "<system-reminder>" in r1 and "<system-reminder>" in r2
+    # 完整版更详细，精简版更短
+    assert len(r2) < len(r1)
+    # 完整版含 PLAN MODE，精简版不含
+    assert "PLAN MODE" in r1
+    assert "PLAN MODE" not in r2
+    # reminder 不写入持久历史
+    for m in conv.messages():
+        assert "<system-reminder>" not in (m.content or "")
+
+
+async def test_normal_mode_no_reminder() -> None:
+    reg, _ = _make_registry()
+    fp = FakeProvider(scripts=[[StreamEvent(text="ok"), StreamEvent(done=True)]])
+    conv = Conversation()
+    conv.add_user("x")
+    _ = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
+    assert fp.captured_reminders[0] == ""
+
+
+async def test_cache_usage_propagated() -> None:
+    reg, _ = _make_registry()
+    fp = FakeProvider(
+        scripts=[
+            [
+                StreamEvent(text="hi"),
+                StreamEvent(
+                    usage=LLMUsage(input_tokens=10, output_tokens=5, cache_write=7, cache_read=9)
+                ),
+                StreamEvent(done=True),
+            ]
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("u")
+    events = [ev async for ev in Agent(fp, reg, "v0").run(conv, Mode.NORMAL, asyncio.Event())]
+    usages = [e.usage for e in events if e.usage is not None]
+    assert usages
+    u = usages[-1]
+    assert u.input == 10 and u.output == 5
+    assert u.cache_write == 7 and u.cache_read == 9

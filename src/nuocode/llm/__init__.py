@@ -17,7 +17,7 @@ ROLE_TOOL = "tool"  # 携带工具执行结果的回合
 Role = Literal["user", "assistant", "tool"]
 
 
-# ───────── 工具相关类型（chap03 新增） ─────────
+# ───────── 工具相关类型 ─────────
 
 
 @dataclass
@@ -69,12 +69,18 @@ class Message:
 class Usage:
     """协议无关地承载一轮请求的 token 用量。
 
-    - input_tokens：本轮请求输入（含完整历史）token 数。
-    - output_tokens：本轮响应输出 token 数。
+    - ``input_tokens``：本轮请求输入（含完整历史）token 数。
+    - ``output_tokens``：本轮响应输出 token 数。
+    - ``cache_write``：本轮写入缓存的 token 数（Anthropic：``cache_creation_input_tokens``；
+      OpenAI 自动缓存无写计数 → 恒 0）。
+    - ``cache_read``：本轮命中缓存复用的 token 数
+      （Anthropic：``cache_read_input_tokens``；OpenAI：``prompt_tokens_details.cached_tokens``）。
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -91,6 +97,31 @@ class StreamEvent:
     err: Exception | None = None
 
 
+# ───────── 系统提示与请求载体（chap05） ─────────
+
+
+@dataclass
+class System:
+    """系统提示双通道载体。
+
+    - ``stable``：可缓存的稳定系统提示（装配自固定模块，跨轮逐字节稳定）。
+    - ``environment``：不缓存的环境信息段（每轮可能变化，独立第二段）。
+    """
+
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass
+class Request:
+    """一次 ``Provider.stream`` 请求的全部入参载体。"""
+
+    messages: list[Message] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
+    system: System = field(default_factory=System)
+    reminder: str = ""  # 本轮 system-reminder 文本（已含标签；空=不注入；不写入持久历史）
+
+
 # ───────── Provider Protocol ─────────
 
 
@@ -102,16 +133,10 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话。
 
-        - ``tools`` 为空表示本次不带工具。
-        - ``system_suffix`` 非空时拼接到内置 SYSTEM_PROMPT 之后（Plan Mode 计划态约束）。
+        ``req`` 承载消息历史、工具集、系统提示双通道（稳定/环境）与本轮 reminder。
         """
         ...
 
@@ -135,11 +160,13 @@ __all__ = [
     "ROLE_USER",
     "Message",
     "Provider",
+    "Request",
     "Role",
     "StreamEvent",
+    "System",
     "ToolCall",
-    "Usage",
     "ToolDefinition",
     "ToolResult",
+    "Usage",
     "new_provider",
 ]

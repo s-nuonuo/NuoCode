@@ -18,9 +18,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
+from nuocode import llm, prompt
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, ToolCall, ToolResult
-from nuocode.prompt import PLAN_MODE_REMINDER
 from nuocode.tool import DEFAULT_TIMEOUT, Registry
 
 # ───────── 常量 ─────────
@@ -30,6 +30,9 @@ MAX_ITERATIONS: int = 25
 
 MAX_UNKNOWN_RUN: int = 3
 """连续「整轮只产生未知工具调用」的迭代数上限（F2）。"""
+
+PLAN_REMINDER_INTERVAL: int = 4
+"""规划模式完整提醒重复间隔（轮数）。"""
 
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
@@ -52,10 +55,12 @@ class Mode(IntEnum):
 
 @dataclass
 class Usage:
-    """一轮请求的 token 用量。"""
+    """一轮请求的 token 用量（含缓存字段）。"""
 
     input: int = 0
     output: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -103,9 +108,10 @@ def _ensure_final(text: str) -> str:
 class Agent:
     """持有 provider 与注册中心，执行 ReAct 循环。"""
 
-    def __init__(self, provider: Provider, registry: Registry) -> None:
+    def __init__(self, provider: Provider, registry: Registry, version: str) -> None:
         self._provider = provider
         self._registry = registry
+        self._version = version
 
     async def run(
         self,
@@ -116,12 +122,15 @@ class Agent:
         if cancel is None:
             cancel = asyncio.Event()
 
+        # 收集环境、装配稳定系统提示（跨轮一致）。
+        env = prompt.gather_environment(self._version, self._provider.model)
+        sys_prompt = prompt.build_system_prompt()
+        env_text = env.render()
+
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
-            suffix = PLAN_MODE_REMINDER
         else:
             defs = self._registry.definitions()
-            suffix = ""
 
         unknown_run = 0
 
@@ -132,13 +141,28 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
+            # 本轮 reminder：规划模式下首轮与间隔轮发完整提醒，其余轮发精简。
+            reminder = ""
+            if mode == Mode.PLAN:
+                full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
+                reminder = prompt.plan_reminder(full)
+
             text_buf: list[str] = []
             calls_buf: list[ToolCall] = []
             usage_buf: list[Usage] = []
             err_holder: list[Exception] = []
 
             async for ev in self._stream_once(
-                conv, defs, suffix, cancel, text_buf, calls_buf, usage_buf, err_holder
+                conv,
+                defs,
+                sys_prompt,
+                env_text,
+                reminder,
+                cancel,
+                text_buf,
+                calls_buf,
+                usage_buf,
+                err_holder,
             ):
                 yield ev
 
@@ -211,7 +235,9 @@ class Agent:
         self,
         conv: Conversation,
         defs,
-        suffix: str,
+        sys_prompt: str,
+        env_text: str,
+        reminder: str,
         cancel: asyncio.Event,
         text_buf: list[str],
         calls_buf: list[ToolCall],
@@ -219,8 +245,14 @@ class Agent:
         err_holder: list[Exception],
     ) -> AsyncIterator[Event]:
         """流式收集双路：实时 yield 文本事件，攒齐 calls 与 usage。"""
+        req = llm.Request(
+            messages=conv.messages(),
+            tools=defs,
+            system=llm.System(stable=sys_prompt, environment=env_text),
+            reminder=reminder,
+        )
         try:
-            async for ev in self._provider.stream(conv.messages(), defs, suffix):
+            async for ev in self._provider.stream(req):
                 if cancel.is_set():
                     return
                 if ev.err is not None:
@@ -234,7 +266,12 @@ class Agent:
                     calls_buf.extend(ev.tool_calls)
                 if ev.usage is not None:
                     usage_buf.append(
-                        Usage(input=ev.usage.input_tokens, output=ev.usage.output_tokens)
+                        Usage(
+                            input=ev.usage.input_tokens,
+                            output=ev.usage.output_tokens,
+                            cache_write=ev.usage.cache_write,
+                            cache_read=ev.usage.cache_read,
+                        )
                     )
                 if ev.done:
                     return
@@ -333,6 +370,7 @@ class Agent:
 __all__ = [
     "MAX_ITERATIONS",
     "MAX_UNKNOWN_RUN",
+    "PLAN_REMINDER_INTERVAL",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",
     "NOTICE_STREAM_ERR",

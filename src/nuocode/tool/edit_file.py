@@ -20,6 +20,7 @@ class EditFileTool:
             "对已有文件做唯一匹配替换：在文件中查找 `old_string`，必须恰好命中一次，"
             "替换为 `new_string` 后写回。若 0 次或多于 1 次会返回错误，"
             "请提供更长的上下文使 `old_string` 唯一。"
+            "编辑前请先用 `read_file` 读取目标文件，确认 `old_string` 在文件中唯一。"
         )
 
     def parameters(self) -> dict[str, Any]:

@@ -148,7 +148,7 @@ class NuoCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
-        self.agent = Agent(self.provider, self.registry)
+        self.agent = Agent(self.provider, self.registry, __version__)
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:

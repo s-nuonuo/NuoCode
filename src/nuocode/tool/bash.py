@@ -20,6 +20,7 @@ class BashTool:
             "在当前工作目录执行 shell 命令，返回 stdout / stderr / 退出码。"
             "用于查看目录、运行测试、执行简单脚本等。"
             "命令通过 /bin/sh -c 执行，支持管道与重定向；非零退出码不视为错误，按结果回灌。"
+            "读文件、找文件、搜内容请优先用 `read_file`/`glob`/`grep`，不要用 bash 拼凑 cat/grep/find 等命令。"
         )
 
     def parameters(self) -> dict[str, Any]:

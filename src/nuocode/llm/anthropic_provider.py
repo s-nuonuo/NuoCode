@@ -13,12 +13,12 @@ from nuocode.config import ProviderConfig
 from nuocode.llm import (
     ROLE_TOOL,
     Message,
+    Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
-from nuocode.prompt import SYSTEM_PROMPT
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -83,10 +83,42 @@ def _has_tool_history(msgs: list[Message]) -> bool:
     return False
 
 
-def _effective_system(suffix: str) -> str:
-    if suffix:
-        return SYSTEM_PROMPT + "\n\n" + suffix
-    return SYSTEM_PROMPT
+def _build_system_blocks(stable: str, environment: str) -> list[dict[str, Any]]:
+    """构造 Anthropic system 列表：稳定块带缓存断点、环境块不带。"""
+    blocks: list[dict[str, Any]] = []
+    if stable:
+        blocks.append(
+            {
+                "type": "text",
+                "text": stable,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    if environment:
+        blocks.append({"type": "text", "text": environment})
+    return blocks
+
+
+def _append_reminder_anthropic(messages: list[dict[str, Any]], reminder: str) -> None:
+    """把 reminder 文本块追加到末条 user 消息的 content；末条非 user 时新起一条 user。"""
+    if not reminder:
+        return
+    block = {"type": "text", "text": reminder}
+    if messages and messages[-1].get("role") == "user":
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            new_content: list[dict[str, Any]] = []
+            if content:
+                new_content.append({"type": "text", "text": content})
+            new_content.append(block)
+            last["content"] = new_content
+        elif isinstance(content, list):
+            content.append(block)
+        else:
+            last["content"] = [block]
+    else:
+        messages.append({"role": "user", "content": [block]})
 
 
 class AnthropicProvider:
@@ -107,23 +139,24 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        sdk_msgs = _to_anthropic_messages(msgs)
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        sdk_msgs = _to_anthropic_messages(req.messages)
+        if req.reminder:
+            _append_reminder_anthropic(sdk_msgs, req.reminder)
+
+        system_blocks = _build_system_blocks(req.system.stable, req.system.environment)
+
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": _effective_system(system_suffix),
             "messages": sdk_msgs,
         }
-        if tools:
-            params["tools"] = _to_anthropic_tools(tools)
+        if system_blocks:
+            params["system"] = system_blocks
+        if req.tools:
+            params["tools"] = _to_anthropic_tools(req.tools)
         # 含工具历史的请求关闭 thinking（避免缺 signature 导致 400）
-        if self._thinking and not _has_tool_history(msgs):
+        if self._thinking and not _has_tool_history(req.messages):
             params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
         try:
@@ -137,8 +170,6 @@ class AnthropicProvider:
                             text = getattr(delta, "text", "") or ""
                             if text:
                                 yield StreamEvent(text=text)
-                        # thinking_delta / input_json_delta：跳过（SDK 内部累加 input）
-                    # 其它事件忽略
                 final_message = await stream.get_final_message()
 
             if getattr(final_message, "stop_reason", None) == "tool_use":
@@ -159,7 +190,16 @@ class AnthropicProvider:
             if usage is not None:
                 in_tok = getattr(usage, "input_tokens", 0) or 0
                 out_tok = getattr(usage, "output_tokens", 0) or 0
-                yield StreamEvent(usage=Usage(input_tokens=in_tok, output_tokens=out_tok))
+                cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+                yield StreamEvent(
+                    usage=Usage(
+                        input_tokens=in_tok,
+                        output_tokens=out_tok,
+                        cache_write=cw,
+                        cache_read=cr,
+                    )
+                )
             yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise

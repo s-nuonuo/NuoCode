@@ -11,13 +11,12 @@ import openai
 from nuocode.config import ProviderConfig
 from nuocode.llm import (
     ROLE_TOOL,
-    Message,
+    Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
-from nuocode.prompt import SYSTEM_PROMPT
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -34,10 +33,18 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-def _to_openai_messages(msgs: list[Message], system_suffix: str = "") -> list[dict[str, Any]]:
-    sys_text = SYSTEM_PROMPT + ("\n\n" + system_suffix if system_suffix else "")
-    out: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
-    for m in msgs:
+def _build_system_text(stable: str, environment: str) -> str:
+    if stable and environment:
+        return stable + "\n\n" + environment
+    return stable or environment
+
+
+def _to_openai_messages(req: Request) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    sys_text = _build_system_text(req.system.stable, req.system.environment)
+    if sys_text:
+        out.append({"role": "system", "content": sys_text})
+    for m in req.messages:
         if m.role == "user":
             out.append({"role": "user", "content": m.content})
         elif m.role == "assistant":
@@ -70,6 +77,8 @@ def _to_openai_messages(msgs: list[Message], system_suffix: str = "") -> list[di
                         "content": r.content,
                     }
                 )
+    if req.reminder:
+        out.append({"role": "user", "content": req.reminder})
     return out
 
 
@@ -90,21 +99,16 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        messages = _to_openai_messages(msgs, system_suffix)
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        messages = _to_openai_messages(req)
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tools:
-            kwargs["tools"] = _to_openai_tools(tools)
+        if req.tools:
+            kwargs["tools"] = _to_openai_tools(req.tools)
 
         # 按 index 累积工具调用分片
         tool_calls_buf: dict[int, dict[str, str]] = {}
@@ -117,10 +121,14 @@ class OpenAIProvider:
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     if chunk_usage is not None:
+                        details = getattr(chunk_usage, "prompt_tokens_details", None)
+                        cached = getattr(details, "cached_tokens", 0) or 0 if details else 0
                         yield StreamEvent(
                             usage=Usage(
                                 input_tokens=getattr(chunk_usage, "prompt_tokens", 0) or 0,
                                 output_tokens=getattr(chunk_usage, "completion_tokens", 0) or 0,
+                                cache_write=0,
+                                cache_read=cached,
                             )
                         )
                     continue
