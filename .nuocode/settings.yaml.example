@@ -1,0 +1,30 @@
+# nuocode 权限配置示例（chap06）
+#
+# 三层配置文件（优先级 本地 > 项目 > 用户）：
+#   - 用户级：~/.nuocode/settings.yaml
+#   - 项目级：<repo>/.nuocode/settings.yaml         （可提交进 git）
+#   - 本地级：<repo>/.nuocode/settings.local.yaml   （已 gitignore，含个人放行）
+#
+# 默认模式：local 优先；皆未配置则 default。
+default_mode: default
+
+# 工具友好名（对应 6 个内置工具）：
+#   Bash → bash 命令执行
+#   Read → 读文件
+#   Write → 写文件
+#   Edit → 改文件
+#   Glob → 按 glob 找文件
+#   Grep → 内容搜索
+#
+# 模式段：精确匹配（如 `Bash(git status)`）或 glob（如 `Bash(git *)`、`Write(src/**)`）。
+# 不带括号表示该工具的全部调用（如 `Read`）。
+permissions:
+  allow:
+    - "Bash(git *)"
+    - "Bash(pytest)"
+    - "Bash(ls *)"
+  # deny 优先于 allow（同一层）。只读类默认即 Allow，主要用 deny 给只读做围栏。
+  deny:
+    - "Read(.env)"
+    - "Write(.env)"
+    - "Bash(rm *)"

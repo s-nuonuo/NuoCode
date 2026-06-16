@@ -1,38 +1,35 @@
-"""Agent：ReAct 循环编排（chap04）。
+"""Agent：ReAct 循环编排（chap04）+ 权限五层防御（chap06）。
 
-每一轮：带工具定义发起请求 → 流式收集 → 若模型请求工具则执行并把结果回灌进历史 → 进入下一轮；
-若模型给出无工具调用的纯文本，则该文本即最终答复，循环结束。
+每一轮：带工具定义发起请求 → 流式收集 → 若模型请求工具则执行（前置 engine.check 五层判定）
+并把结果回灌进历史 → 进入下一轮；若模型给出无工具调用的纯文本，则该文本即最终答复，循环结束。
 
-停止条件：
-- 自然完成（无工具调用）
-- 迭代上限 MAX_ITERATIONS 兜底
-- 用户取消（cancel.is_set()）
-- 连续 MAX_UNKNOWN_RUN 轮仅请求未知工具
-- provider 流出错
+权限判定（chap06）：
+- 工具执行前调用 ``engine.check(mode, call, read_only)`` 走前四层（黑名单/沙箱/规则/模式兜底）。
+- Allow → 正常执行；Deny → 构造 is_error 的 ToolResult 回灌（不中断）；
+- Ask → 发出 ``ApprovalRequest`` 事件并 await 用户三选一。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 
 from nuocode import llm, prompt
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, ToolCall, ToolResult
+from nuocode.permission import Engine, Mode, Outcome
 from nuocode.tool import DEFAULT_TIMEOUT, Registry
+
+logger = logging.getLogger(__name__)
 
 # ───────── 常量 ─────────
 
 MAX_ITERATIONS: int = 25
-"""迭代上限兜底（F2）。"""
-
 MAX_UNKNOWN_RUN: int = 3
-"""连续「整轮只产生未知工具调用」的迭代数上限（F2）。"""
-
 PLAN_REMINDER_INTERVAL: int = 4
-"""规划模式完整提醒重复间隔（轮数）。"""
 
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
@@ -48,15 +45,8 @@ class Phase(Enum):
     END = "end"
 
 
-class Mode(IntEnum):
-    NORMAL = 0
-    PLAN = 1
-
-
 @dataclass
 class Usage:
-    """一轮请求的 token 用量（含缓存字段）。"""
-
     input: int = 0
     output: int = 0
     cache_write: int = 0
@@ -73,9 +63,21 @@ class ToolEvent:
 
 
 @dataclass
-class Event:
-    """对外事件流元素。"""
+class ApprovalRequest:
+    """人在回路：等待用户三选一。
 
+    TUI 收到后必须调 ``respond.set_result(Outcome.X)``，否则 agent 阻塞。
+    取消（Esc/Ctrl+C）时 TUI 兜底 ``set_result(Outcome.DENY_ONCE)`` 再触发取消。
+    """
+
+    name: str
+    args: str
+    reason: str
+    respond: asyncio.Future[Outcome]
+
+
+@dataclass
+class Event:
     text: str = ""
     tool: ToolEvent | None = None
     usage: Usage | None = None
@@ -83,6 +85,7 @@ class Event:
     notice: str = ""
     done: bool = False
     err: Exception | None = None
+    approval: ApprovalRequest | None = None
 
 
 # ───────── 辅助 ─────────
@@ -106,23 +109,29 @@ def _ensure_final(text: str) -> str:
 
 
 class Agent:
-    """持有 provider 与注册中心，执行 ReAct 循环。"""
+    """持有 provider / registry / engine，执行 ReAct 循环。"""
 
-    def __init__(self, provider: Provider, registry: Registry, version: str) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        registry: Registry,
+        version: str,
+        engine: Engine,
+    ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
+        self._engine = engine
 
     async def run(
         self,
         conv: Conversation,
-        mode: Mode = Mode.NORMAL,
+        mode: Mode = Mode.DEFAULT,
         cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         if cancel is None:
             cancel = asyncio.Event()
 
-        # 收集环境、装配稳定系统提示（跨轮一致）。
         env = prompt.gather_environment(self._version, self._provider.model)
         sys_prompt = prompt.build_system_prompt()
         env_text = env.render()
@@ -141,7 +150,6 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
-            # 本轮 reminder：规划模式下首轮与间隔轮发完整提醒，其余轮发精简。
             reminder = ""
             if mode == Mode.PLAN:
                 full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
@@ -167,7 +175,6 @@ class Agent:
                 yield ev
 
             if err_holder:
-                # 流出错：notice + 历史收尾
                 yield Event(notice=NOTICE_STREAM_ERR)
                 self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
                 return
@@ -184,36 +191,44 @@ class Agent:
                 yield Event(usage=usage)
 
             if not calls:
-                # 自然完成
                 conv.add_assistant(_ensure_final(text))
                 yield Event(done=True)
                 return
 
-            # 有工具调用
             conv.add_assistant_with_tool_calls(text, calls)
 
-            # 统计未知工具
             if self._all_unknown(calls):
                 unknown_run += 1
             else:
                 unknown_run = 0
 
-            # 执行（保序分批）
             results: list[ToolResult | None] = [None] * len(calls)
             completed = True
-            async for ev in self._execute_batched(calls, cancel, results):
-                yield ev
-            # 检查是否被取消
+            try:
+                async for ev in self._execute_batched(calls, mode, cancel, results):
+                    yield ev
+            except asyncio.CancelledError:
+                # 取消收尾
+                completed = False
+                for k, c in enumerate(calls):
+                    if results[k] is None:
+                        results[k] = ToolResult(
+                            tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
+                        )
+                real_results: list[ToolResult] = [r for r in results if r is not None]
+                conv.add_tool_results(real_results)
+                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+                raise
+
             if any(r is None for r in results):
                 completed = False
-                # 把未完成的位置填上「已取消」
                 for k, c in enumerate(calls):
                     if results[k] is None:
                         results[k] = ToolResult(
                             tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
                         )
 
-            real_results: list[ToolResult] = [r for r in results if r is not None]
+            real_results = [r for r in results if r is not None]
             conv.add_tool_results(real_results)
 
             if not completed:
@@ -226,7 +241,6 @@ class Agent:
                 yield Event(done=True)
                 return
 
-        # 触达迭代上限
         yield Event(notice=NOTICE_MAX_ITER)
         self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield Event(done=True)
@@ -244,7 +258,6 @@ class Agent:
         usage_buf: list[Usage],
         err_holder: list[Exception],
     ) -> AsyncIterator[Event]:
-        """流式收集双路：实时 yield 文本事件，攒齐 calls 与 usage。"""
         req = llm.Request(
             messages=conv.messages(),
             tools=defs,
@@ -284,10 +297,13 @@ class Agent:
     async def _execute_batched(
         self,
         calls: list[ToolCall],
+        mode: Mode,
         cancel: asyncio.Event,
         results: list[ToolResult | None],
     ) -> AsyncIterator[Event]:
-        """保序分批：连续只读并发，有副作用串行；事件「PHASE_START 按序、PHASE_END 按序」。"""
+        """保序分批：连续只读并发；有副作用串行；事件 START/END 按调用序。"""
+        from nuocode.permission import Decision
+
         i = 0
         n = len(calls)
         while i < n:
@@ -298,9 +314,14 @@ class Agent:
                 j = i
                 while j < n and self._registry.is_read_only(calls[j].name):
                     j += 1
-                # 区间 [i, j) 并发
-                # 先按序 yield PHASE_START
+
                 previews = [_preview_args(calls[k].input) for k in range(i, j)]
+                # 先为每个只读调用做权限预判（只读永不 Ask；可能 Allow / Deny）
+                decisions: list[tuple[Decision, str]] = []
+                for k in range(i, j):
+                    decisions.append(self._engine.check(mode, calls[k], True))
+
+                # 按序发 PHASE_START
                 for k in range(i, j):
                     yield Event(
                         tool=ToolEvent(
@@ -309,15 +330,27 @@ class Agent:
                             phase=Phase.START,
                         )
                     )
-                # 并发执行
-                tasks = [asyncio.create_task(self._run_one(calls[k])) for k in range(i, j)]
-                gathered = await asyncio.gather(*tasks, return_exceptions=False)
-                for offset, res in enumerate(gathered):
-                    k = i + offset
-                    results[k] = ToolResult(
-                        tool_call_id=calls[k].id, content=res.content, is_error=res.is_error
-                    )
-                # 按序 yield PHASE_END
+
+                # 分流：Allow 进 gather；Deny 直接置结果
+                tasks: dict[int, asyncio.Task] = {}
+                for k in range(i, j):
+                    d, reason = decisions[k - i]
+                    if d == Decision.DENY:
+                        results[k] = ToolResult(
+                            tool_call_id=calls[k].id, content=reason, is_error=True
+                        )
+                    else:
+                        tasks[k] = asyncio.create_task(self._run_one(calls[k]))
+                if tasks:
+                    gathered = await asyncio.gather(*tasks.values(), return_exceptions=False)
+                    for k, res in zip(tasks.keys(), gathered, strict=True):
+                        results[k] = ToolResult(
+                            tool_call_id=calls[k].id,
+                            content=res.content,
+                            is_error=res.is_error,
+                        )
+
+                # 按序发 PHASE_END
                 for k in range(i, j):
                     r = results[k]
                     assert r is not None
@@ -332,20 +365,65 @@ class Agent:
                     )
                 i = j
             else:
-                # 串行单个
+                # 串行单个：先权限判定
                 preview = _preview_args(calls[i].input)
                 yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
-                res = await self._run_one(calls[i])
-                results[i] = ToolResult(
-                    tool_call_id=calls[i].id, content=res.content, is_error=res.is_error
-                )
+
+                decision, reason = self._engine.check(mode, calls[i], False)
+
+                if decision == Decision.ALLOW:
+                    res = await self._run_one(calls[i])
+                    results[i] = ToolResult(
+                        tool_call_id=calls[i].id,
+                        content=res.content,
+                        is_error=res.is_error,
+                    )
+                elif decision == Decision.DENY:
+                    results[i] = ToolResult(tool_call_id=calls[i].id, content=reason, is_error=True)
+                else:
+                    # Ask：人在回路 —— 在 generator 内 yield ApprovalRequest 事件
+                    loop = asyncio.get_running_loop()
+                    respond: asyncio.Future[Outcome] = loop.create_future()
+                    req = ApprovalRequest(
+                        name=calls[i].name,
+                        args=preview,
+                        reason=reason,
+                        respond=respond,
+                    )
+                    yield Event(approval=req)
+                    try:
+                        outcome = await respond
+                    except asyncio.CancelledError:
+                        # 上层会捕获 → 取消收尾
+                        raise
+                    if outcome == Outcome.DENY_ONCE:
+                        results[i] = ToolResult(
+                            tool_call_id=calls[i].id,
+                            content=f"用户拒绝此次工具调用：{reason}",
+                            is_error=True,
+                        )
+                    else:
+                        if outcome == Outcome.ALLOW_FOREVER:
+                            try:
+                                self._engine.persist_local_allow(calls[i])
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning("写入永久放行规则失败: %s", e)
+                        res = await self._run_one(calls[i])
+                        results[i] = ToolResult(
+                            tool_call_id=calls[i].id,
+                            content=res.content,
+                            is_error=res.is_error,
+                        )
+
+                r = results[i]
+                assert r is not None
                 yield Event(
                     tool=ToolEvent(
                         name=calls[i].name,
                         args=preview,
                         phase=Phase.END,
-                        result=res.content,
-                        is_error=res.is_error,
+                        result=r.content,
+                        is_error=r.is_error,
                     )
                 )
                 i += 1
@@ -376,6 +454,7 @@ __all__ = [
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
     "Agent",
+    "ApprovalRequest",
     "Event",
     "Mode",
     "Phase",

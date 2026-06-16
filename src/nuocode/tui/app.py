@@ -1,4 +1,4 @@
-"""nuocode Textual App：状态机 + 渲染 + 流式 + 选择（chap04 Agent Loop）。"""
+"""nuocode Textual App：状态机 + 渲染 + 流式 + 选择 + 权限五层（chap04/06）。"""
 
 from __future__ import annotations
 
@@ -16,15 +16,18 @@ from textual.widgets.option_list import Option
 
 from nuocode import __version__
 from nuocode import prompt as prompt_mod
-from nuocode.agent import Agent, Mode, Phase
+from nuocode.agent import Agent, ApprovalRequest, Phase
 from nuocode.config import ProviderConfig
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, new_provider
+from nuocode.permission import Engine, Mode, Outcome
 from nuocode.prompt import render_banner
 from nuocode.tool import Registry
 from nuocode.tui.view import (
+    approval_block,
     assistant_block,
     error_block,
+    notice_block,
     status_line,
     tool_line,
     tool_result_summary,
@@ -36,6 +39,7 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+    APPROVING = "approving"
 
 
 @dataclass
@@ -44,9 +48,21 @@ class _ToolDisplay:
     args: str
 
 
-class _ChatInput(TextArea):
-    """多行输入：Enter 提交、Alt+Enter 插入换行。"""
+def next_mode(m: Mode) -> Mode:
+    """循环：DEFAULT → ACCEPT_EDITS → PLAN → BYPASS → DEFAULT。"""
+    return Mode((int(m) + 1) % 4)
 
+
+def outcome_for_index(idx: int) -> Outcome:
+    """0=ALLOW_ONCE, 1=ALLOW_FOREVER, 2=DENY_ONCE。"""
+    if idx == 0:
+        return Outcome.ALLOW_ONCE
+    if idx == 1:
+        return Outcome.ALLOW_FOREVER
+    return Outcome.DENY_ONCE
+
+
+class _ChatInput(TextArea):
     BINDINGS = [
         Binding("enter", "submit", "Submit", show=False, priority=True),
         Binding("alt+enter", "newline", "Newline", show=False, priority=True),
@@ -78,20 +94,22 @@ class NuoCodeApp(App):
     .hidden { display: none; }
     """
 
-    # ctrl+c / escape 自定义处理（不直接绑定 quit）
     BINDINGS = [
         Binding("ctrl+c", "ctrl_c", "Quit/Cancel", priority=True),
         Binding("escape", "esc", "Cancel", priority=True, show=False),
+        Binding("shift+tab", "cycle_mode", "Mode", priority=True, show=False),
     ]
 
     def __init__(
         self,
         providers: list[ProviderConfig],
         registry: Registry,
+        engine: Engine,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
         self.registry: Registry = registry
+        self.engine: Engine = engine
         self.provider: Provider | None = None
         self.agent: Agent | None = None
         self.conv: Conversation = Conversation()
@@ -101,12 +119,15 @@ class NuoCodeApp(App):
         self.cur_tools: list[_ToolDisplay] = []
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
-        # chap04
-        self.mode: Mode = Mode.NORMAL
+        # chap04 / 06
+        self.mode: Mode = engine.start_mode()
         self.iter: int = 0
         self.usage_in: int = 0
         self.usage_out: int = 0
         self.turn_cancel: asyncio.Event | None = None
+        # chap06：人在回路
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor: int = 0
 
     # ───────── compose ─────────
 
@@ -123,8 +144,6 @@ class NuoCodeApp(App):
         ta.show_line_numbers = False
         yield ta
         yield Static("", id="statusbar")
-
-    # ───────── lifecycle ─────────
 
     def on_mount(self) -> None:
         log = self.query_one("#log", RichLog)
@@ -148,7 +167,7 @@ class NuoCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
-        self.agent = Agent(self.provider, self.registry, __version__)
+        self.agent = Agent(self.provider, self.registry, __version__, self.engine)
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:
@@ -158,9 +177,8 @@ class NuoCodeApp(App):
             return
         bar.update(
             status_line(
-                self.provider.name,
+                self.mode,
                 self.provider.model,
-                plan_mode=(self.mode == Mode.PLAN),
                 usage_in=self.usage_in,
                 usage_out=self.usage_out,
             )
@@ -210,7 +228,7 @@ class NuoCodeApp(App):
             self._refresh_statusbar()
             return
         if stripped == "/do":
-            self.mode = Mode.NORMAL
+            self.mode = Mode.DEFAULT
             self.conv.add_user(prompt_mod.EXECUTE_DIRECTIVE)
             log.write(user_block(prompt_mod.EXECUTE_DIRECTIVE))
         else:
@@ -247,6 +265,18 @@ class NuoCodeApp(App):
         footer = f"\n\n[{label}]"
         self.query_one("#streaming", Static).update(f"{prefix}{body}{footer}")
 
+    def _refresh_approving_view(self) -> None:
+        if self.pending is None:
+            return
+        self.query_one("#streaming", Static).update(
+            approval_block(
+                self.pending.name,
+                self.pending.args,
+                self.pending.reason,
+                self.approve_cursor,
+            )
+        )
+
     async def _consume_agent_events(self) -> None:
         assert self.agent is not None
         log = self.query_one("#log", RichLog)
@@ -256,6 +286,18 @@ class NuoCodeApp(App):
                 if ev.err is not None:
                     log.write(error_block(ev.err))
                     continue
+                if ev.approval is not None:
+                    # 进入 APPROVING 态，等待用户三选一
+                    self.pending = ev.approval
+                    self.approve_cursor = 0
+                    self.state = SessionState.APPROVING
+                    self._refresh_approving_view()
+                    await self._wait_for_approval()
+                    # 收到决策后回到 STREAMING
+                    self.state = SessionState.STREAMING
+                    self.pending = None
+                    self._refresh_streaming_view()
+                    continue
                 if ev.tool is not None:
                     if ev.tool.phase is Phase.START:
                         if self.cur_reply.strip():
@@ -264,7 +306,6 @@ class NuoCodeApp(App):
                         self.cur_tools.append(_ToolDisplay(ev.tool.name, ev.tool.args))
                         self._refresh_streaming_view()
                     else:
-                        # FIFO 弹首
                         if self.cur_tools:
                             self.cur_tools.pop(0)
                         log.write(tool_line(ev.tool.name, ev.tool.args))
@@ -286,7 +327,6 @@ class NuoCodeApp(App):
                 if ev.done:
                     self._finish_with_assistant(self.cur_reply)
                     return
-            # generator 自然结束（取消 / 出错 / 上限文案已发出，但无 done）
             self._finish_turn()
         except asyncio.CancelledError:
             self._finish_turn()
@@ -294,6 +334,15 @@ class NuoCodeApp(App):
         except Exception as e:  # noqa: BLE001
             log.write(error_block(e))
             self._finish_turn()
+
+    async def _wait_for_approval(self) -> None:
+        """等待 self.pending.respond 完成（由按键回调 set_result）。"""
+        if self.pending is None:
+            return
+        try:
+            await self.pending.respond
+        except asyncio.CancelledError:
+            raise
 
     def _finish_with_assistant(self, reply: str) -> None:
         log = self.query_one("#log", RichLog)
@@ -310,10 +359,14 @@ class NuoCodeApp(App):
         self.cur_tools = []
         self.iter = 0
         self.turn_cancel = None
-        self.query_one("#streaming", Static).update("")
-        self.state = SessionState.IDLE
-        self._refresh_statusbar()
+        self.pending = None
         try:
+            self.query_one("#streaming", Static).update("")
+        except Exception:  # noqa: BLE001
+            return
+        self.state = SessionState.IDLE
+        try:
+            self._refresh_statusbar()
             self.query_one("#input", _ChatInput).focus()
         except Exception:  # noqa: BLE001
             pass
@@ -321,11 +374,83 @@ class NuoCodeApp(App):
     # ───────── 按键 ─────────
 
     def action_ctrl_c(self) -> None:
+        self._handle_cancel(exit_if_idle=True)
+
+    def action_esc(self) -> None:
+        self._handle_cancel(exit_if_idle=False)
+
+    def _handle_cancel(self, exit_if_idle: bool) -> None:
+        if self.state is SessionState.APPROVING and self.pending is not None:
+            # 兜底：先解开 future，再走取消
+            if not self.pending.respond.done():
+                self.pending.respond.set_result(Outcome.DENY_ONCE)
+            if self.turn_cancel is not None:
+                self.turn_cancel.set()
+            return
         if self.state is SessionState.STREAMING and self.turn_cancel is not None:
             self.turn_cancel.set()
             return
-        self.exit()
+        if exit_if_idle:
+            self.exit()
 
-    def action_esc(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
-            self.turn_cancel.set()
+    def action_cycle_mode(self) -> None:
+        if self.state is not SessionState.IDLE:
+            return
+        self.mode = next_mode(self.mode)
+        try:
+            log = self.query_one("#log", RichLog)
+            label, _ = __import__("nuocode.tui.view", fromlist=["mode_badge"]).mode_badge(self.mode)
+            log.write(notice_block(f"已切换到 {label} 模式"))
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_statusbar()
+
+    # ───────── 待批准态按键 ─────────
+
+    def on_key(self, event) -> None:
+        if self.state is not SessionState.APPROVING:
+            return
+        if self.pending is None:
+            return
+        key = event.key
+        handled = self._update_approving(key)
+        if handled:
+            event.stop()
+            event.prevent_default()
+
+    def _update_approving(self, key: str) -> bool:
+        if self.pending is None:
+            return False
+        if key in ("up", "k"):
+            self.approve_cursor = (self.approve_cursor - 1) % 3
+            self._refresh_approving_view()
+            return True
+        if key in ("down", "j"):
+            self.approve_cursor = (self.approve_cursor + 1) % 3
+            self._refresh_approving_view()
+            return True
+        if key in ("enter", "space"):
+            self._submit_outcome(outcome_for_index(self.approve_cursor))
+            return True
+        if key == "1":
+            self._submit_outcome(Outcome.ALLOW_ONCE)
+            return True
+        if key == "2":
+            self._submit_outcome(Outcome.ALLOW_FOREVER)
+            return True
+        if key == "3":
+            self._submit_outcome(Outcome.DENY_ONCE)
+            return True
+        if key in ("y",):
+            self._submit_outcome(Outcome.ALLOW_ONCE)
+            return True
+        if key in ("n", "d"):
+            self._submit_outcome(Outcome.DENY_ONCE)
+            return True
+        return False
+
+    def _submit_outcome(self, outcome: Outcome) -> None:
+        if self.pending is None:
+            return
+        if not self.pending.respond.done():
+            self.pending.respond.set_result(outcome)
