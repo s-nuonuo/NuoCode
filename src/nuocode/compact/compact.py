@@ -71,9 +71,7 @@ async def manage_context(in_: ManageInput) -> ManageOutput:
     if in_.trigger == TriggerKind.MANUAL:
         new_msgs, before_tok2, after_tok = await force_compact(in_)
         in_.conv.replace_messages(new_msgs)
-        logger.info(
-            "compact manual: before=%d after=%d", before_tok2, after_tok
-        )
+        logger.info("compact manual: before=%d after=%d", before_tok2, after_tok)
         return ManageOutput(before_tokens=before_tok2, after_tokens=after_tok)
 
     if in_.trigger == TriggerKind.EMERGENCY:
@@ -81,9 +79,7 @@ async def manage_context(in_: ManageInput) -> ManageOutput:
         in_.conv.replace_messages(layer1_out)
         new_msgs, _, after_tok = await force_compact(in_)
         in_.conv.replace_messages(new_msgs)
-        logger.info(
-            "compact emergency: before=%d after=%d", before_tok, after_tok
-        )
+        logger.info("compact emergency: before=%d after=%d", before_tok, after_tok)
         return ManageOutput(before_tokens=before_tok, after_tokens=after_tok)
 
     # ── AUTO 分支 ──
@@ -114,9 +110,7 @@ async def manage_context(in_: ManageInput) -> ManageOutput:
     in_.estimated_token = est_tokens
     new_msgs, _, after_tok = await auto_compact(in_)
     in_.conv.replace_messages(new_msgs)
-    logger.info(
-        "compact auto: before=%d after=%d", before_tok, after_tok
-    )
+    logger.info("compact auto: before=%d after=%d", before_tok, after_tok)
     return ManageOutput(before_tokens=before_tok, after_tokens=after_tok)
 
 

@@ -325,9 +325,7 @@ async def test_ptl_retry_succeeds_after_dropping_oldest() -> None:
 @pytest.mark.asyncio
 async def test_ptl_retry_raises_when_all_groups_consumed() -> None:
     # 所有重试都返回 PTL
-    provider = _FakeProvider(
-        [PromptTooLongError("retry-1"), PromptTooLongError("retry-2")]
-    )
+    provider = _FakeProvider([PromptTooLongError("retry-1"), PromptTooLongError("retry-2")])
     from nuocode.compact.compact import ManageInput as MI
 
     mi = MI(
@@ -514,9 +512,7 @@ def test_provider_config_effective_context_window() -> None:
     )
     assert cfg.effective_context_window() == 200_000
 
-    cfg2 = ProviderConfig(
-        name="x", protocol="openai", api_key="k", model="m", context_window=None
-    )
+    cfg2 = ProviderConfig(name="x", protocol="openai", api_key="k", model="m", context_window=None)
     assert cfg2.effective_context_window() == 128_000
 
     cfg3 = ProviderConfig(

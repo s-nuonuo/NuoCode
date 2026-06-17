@@ -40,6 +40,7 @@ class SessionState(Enum):
     IDLE = "idle"
     STREAMING = "streaming"
     APPROVING = "approving"
+    RESUMING = "resuming"
 
 
 @dataclass
@@ -106,6 +107,11 @@ class NuoCodeApp(App):
         registry: Registry,
         engine: Engine,
         runtime: SessionRuntime | None = None,
+        writer=None,
+        mem_mgr=None,
+        instruction_text: str = "",
+        memory_text: str = "",
+        sessions_dir: str = "",
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
@@ -118,9 +124,20 @@ class NuoCodeApp(App):
 
             runtime = SessionRuntime(session=new_session_context(tempfile.gettempdir()))
         self.runtime: SessionRuntime = runtime
+        self.writer = writer
+        self.mem_mgr = mem_mgr
+        self.instruction_text = instruction_text
+        self.memory_text = memory_text
+        self.sessions_dir = sessions_dir
         self.provider: Provider | None = None
         self.agent: Agent | None = None
-        self.conv: Conversation = Conversation()
+        if writer is not None:
+            self.conv: Conversation = Conversation(
+                on_append=writer.on_append, on_replace=writer.on_replace
+            )
+        else:
+            self.conv = Conversation()
+        self._resume_items: list = []
         self.state: SessionState = SessionState.IDLE
         self.cur_reply: str = ""
         self.turn_start: float = 0.0
@@ -182,7 +199,16 @@ class NuoCodeApp(App):
             self.engine,
             self.runtime,
             cfg.effective_context_window(),
+            memory_manager=self.mem_mgr,
+            instruction_text=self.instruction_text,
+            memory_text=self.memory_text,
         )
+        # 将 model 名推送给 writer，以便首条消息带 model 字段
+        if self.writer is not None:
+            self.writer.set_model(cfg.model)
+        # provider 选定后绑定给记忆管理器
+        if self.mem_mgr is not None:
+            self.mem_mgr.set_provider(self.provider, cfg.model)
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:
@@ -211,10 +237,20 @@ class NuoCodeApp(App):
     # ───────── select handler ─────────
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if self.state is not SessionState.SELECTING:
-            return
         opt_id = event.option.id
         if opt_id is None:
+            return
+        # /resume 列表：opt_id 形如 ``resume:N``
+        if (
+            self.state is SessionState.RESUMING
+            and isinstance(opt_id, str)
+            and opt_id.startswith("resume:")
+        ):
+            from nuocode.tui import resume as resume_mod
+
+            resume_mod.handle_resume_selection(self, opt_id)
+            return
+        if self.state is not SessionState.SELECTING:
             return
         try:
             idx = int(opt_id)
@@ -414,6 +450,11 @@ class NuoCodeApp(App):
         self._handle_cancel(exit_if_idle=False)
 
     def _handle_cancel(self, exit_if_idle: bool) -> None:
+        if self.state is SessionState.RESUMING:
+            from nuocode.tui import resume as resume_mod
+
+            resume_mod.cancel_resume(self)
+            return
         if self.state is SessionState.APPROVING and self.pending is not None:
             # 兜底：先解开 future，再走取消
             if not self.pending.respond.done():

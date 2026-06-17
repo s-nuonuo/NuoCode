@@ -55,11 +55,28 @@ def _cmd_compact(app: NuoCodeApp, _arg: str) -> bool:
     return True
 
 
+def _cmd_resume(app: NuoCodeApp, _arg: str) -> bool:
+    """``/resume``：进入会话恢复列表。仅 IDLE 可用。"""
+    from textual.widgets import RichLog
+
+    from nuocode.tui.app import SessionState
+
+    if app.state is not SessionState.IDLE:
+        log = app.query_one("#log", RichLog)
+        log.write("● 请等待当前任务完成。")
+        return True
+    from nuocode.tui import resume as resume_mod
+
+    resume_mod.begin_resume(app)
+    return True
+
+
 _REGISTRY: dict[str, callable] = {
     "/exit": _cmd_exit,
     "/plan": _cmd_plan,
     "/do": _cmd_do,
     "/compact": _cmd_compact,
+    "/resume": _cmd_resume,
 }
 
 

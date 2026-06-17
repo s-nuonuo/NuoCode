@@ -137,6 +137,9 @@ class Agent:
         engine: Engine,
         runtime: SessionRuntime | None = None,
         context_window: int = 200_000,
+        memory_manager=None,
+        instruction_text: str = "",
+        memory_text: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -151,6 +154,10 @@ class Agent:
             runtime = SessionRuntime(session=new_session_context(tempfile.gettempdir()))
         self._runtime = runtime
         self._context_window = context_window
+        self._mem_mgr = memory_manager
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
+        self._turn_count = 0
 
     @property
     def runtime(self) -> SessionRuntime:
@@ -176,7 +183,7 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         env = prompt.gather_environment(self._version, self._provider.model)
-        sys_prompt = prompt.build_system_prompt()
+        sys_prompt = prompt.build_system_prompt(self._instruction_text, self._memory_text)
         env_text = env.render()
 
         if mode == Mode.PLAN:
@@ -322,6 +329,7 @@ class Agent:
 
         if not calls:
             conv.add_assistant(_ensure_final(text))
+            self._maybe_trigger_memory_update(conv)
             yield Event(done=True)
             return
 
@@ -426,9 +434,7 @@ class Agent:
     ) -> AsyncIterator[Event]:
         """共享 compact 入口：把估算 → manage_context → CompactEvent 串起来。"""
         msgs = conv.messages()
-        est = estimate_tokens(
-            self._runtime.usage_anchor, msgs, self._runtime.anchor_msg_len
-        )
+        est = estimate_tokens(self._runtime.usage_anchor, msgs, self._runtime.anchor_msg_len)
         in_ = ManageInput(
             conv=conv,
             provider=self._provider,
@@ -488,9 +494,7 @@ class Agent:
 
     # ───────── 文件追踪 ─────────
 
-    def _track_file_reads(
-        self, calls: list[ToolCall], results: list[ToolResult]
-    ) -> None:
+    def _track_file_reads(self, calls: list[ToolCall], results: list[ToolResult]) -> None:
         """把 ``ReadFile`` 工具的成功结果写进 RecoveryState。
 
         约定：``ReadFile`` 工具入参 JSON 中带 ``path`` 字段；结果为带行号前缀的文本。
@@ -663,6 +667,33 @@ class Agent:
 
     def _finish_cancelled(self, conv: Conversation) -> None:
         self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+
+    def _maybe_trigger_memory_update(self, conv: Conversation) -> None:
+        """Done 分支末尾：每 5 轮或显式记忆请求触发异步记忆更新。"""
+        if self._mem_mgr is None:
+            return
+        self._turn_count += 1
+        recent = self._extract_recent_turn(conv)
+        try:
+            from nuocode.memory import Manager as _MemMgr  # noqa: N814
+        except Exception:  # noqa: BLE001
+            return
+        has_signal = _MemMgr.has_memory_signal(recent)
+        if not (self._turn_count % 5 == 0 or has_signal):
+            return
+        try:
+            asyncio.create_task(self._mem_mgr.update_async(recent))
+        except RuntimeError:
+            # 无运行中的 event loop（极少触发）
+            logger.debug("无 event loop，跳过记忆更新")
+
+    def _extract_recent_turn(self, conv: Conversation) -> list:
+        """从最后一条 user 消息到结尾。"""
+        msgs = conv.messages()
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].role == llm.ROLE_USER:
+                return msgs[i:]
+        return msgs[-2:] if len(msgs) >= 2 else msgs
 
 
 __all__ = [

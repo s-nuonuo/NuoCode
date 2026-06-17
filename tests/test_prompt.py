@@ -149,3 +149,29 @@ def test_plan_reminder_full_vs_concise() -> None:
     assert "/do" in full
     # 精简版更短
     assert len(concise) < len(full)
+
+
+# ───────── chap09: build_system_prompt 参数化 ─────────
+
+
+def test_build_system_prompt_with_instructions_and_memory() -> None:
+    text = build_system_prompt("CUSTOM_RULE_X", "MEMORY_INDEX_Y")
+    assert "CUSTOM_RULE_X" in text
+    assert "MEMORY_INDEX_Y" in text
+    # custom-instructions(80) 在 long-term-memory(100) 前
+    assert text.index("CUSTOM_RULE_X") < text.index("MEMORY_INDEX_Y")
+
+
+def test_build_system_prompt_empty_args_compatible() -> None:
+    """空字符串 → 与 ch08 默认行为一致（不出现空模块）。"""
+    text = build_system_prompt("", "")
+    assert "\n\n\n" not in text
+    # 与无参调用结果一致
+    assert text == build_system_prompt()
+
+
+def test_optional_modules_skips_empty_slot() -> None:
+    mods = optional_modules("", "MEM")
+    contents = {m.name: m.content for m in mods}
+    assert contents["custom_instructions"] == ""
+    assert contents["long_term_memory"] == "MEM"

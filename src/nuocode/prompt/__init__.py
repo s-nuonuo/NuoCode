@@ -22,12 +22,14 @@ def assemble_system(mods: list[Module]) -> str:
     return "\n\n".join(parts)
 
 
-def build_system_prompt() -> str:
-    """装配完整稳定系统提示（七固定模块 + 三空槽）。
+def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+    """装配完整稳定系统提示（七固定模块 + 三可选槽）。
 
-    内容跨轮逐字节稳定（N1）：不混入任何随轮次/时间变化的成分。
+    - ``instructions``：项目指令文件（nuocode.md）拼接后的文本，注入 priority 80。
+    - ``memory``：长期记忆索引文本，注入 priority 100。
+    - 任一参数为空字符串时对应模块跳过（与 ch08 行为一致）。
     """
-    return assemble_system(fixed_modules() + optional_modules())
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
 
 
 # ───────── 启动横幅（保留） ─────────

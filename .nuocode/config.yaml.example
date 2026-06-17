@@ -20,3 +20,21 @@ providers:
     model: deepseek-v4-pro
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     context_window: 128000
+
+# ─── chap09: 项目记忆与会话持久化 ───
+#
+# 项目指令文件（按优先级加载，靠前的优先）：
+#   1. <project_root>/nuocode.md               （项目级，最高）
+#   2. <project_root>/.nuocode/nuocode.md      （项目配置级）
+#   3. ~/.nuocode/nuocode.md                   （用户级）
+#   - 支持独占行 `@include <relative_path>` 引入其他文件，最大嵌套 5 层。
+#
+# 会话存档：
+#   - .nuocode/sessions/<YYYYMMDD-HHMMSS-xxxx>/conversation.jsonl
+#   - tool-results/  （chap08 工具结果落盘）
+#   - 30 天前的目录在启动时自动清理。
+#
+# 自动笔记 / 长期记忆：
+#   - .nuocode/memory/   （项目级，存放 project_knowledge / reference_material）
+#   - ~/.nuocode/memory/ （用户级，存放 user_preference / correction_feedback）
+#   - 每级有 MEMORY.md 索引，启动时拼接注入系统提示（priority 100）。

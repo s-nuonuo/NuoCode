@@ -62,3 +62,44 @@ def test_last_role() -> None:
     assert c.last_role() == ROLE_TOOL
     c.add_assistant("done")
     assert c.last_role() == ROLE_ASSISTANT
+
+
+def test_on_append_callback_invoked() -> None:
+    captured: list = []
+    c = Conversation(on_append=lambda m: captured.append(m))
+    c.add_user("hi")
+    c.add_assistant("hello")
+    c.add_assistant_with_tool_calls("p", [ToolCall(id="t1", name="x", input="{}")])
+    c.add_tool_results([ToolResult(tool_call_id="t1", content="ok")])
+    assert [m.role for m in captured] == [ROLE_USER, ROLE_ASSISTANT, ROLE_ASSISTANT, ROLE_TOOL]
+
+
+def test_on_replace_callback_invoked() -> None:
+    captured: list[list] = []
+    c = Conversation(on_replace=lambda msgs: captured.append(msgs))
+    c.add_user("a")
+    c.replace_messages([])
+    assert len(captured) == 1
+    assert captured[0] == []
+
+
+def test_no_callback_default_behavior() -> None:
+    """无回调时所有 add/replace 行为不变。"""
+    c = Conversation()
+    c.add_user("hi")
+    c.add_assistant("hello")
+    assert c.length() == 2
+    c.replace_messages([])
+    assert c.length() == 0
+
+
+def test_from_messages_does_not_trigger_append() -> None:
+    captured: list = []
+    from nuocode.llm import Message
+
+    initial = [Message(role=ROLE_USER, content="x")]
+    c = Conversation.from_messages(initial, on_append=lambda m: captured.append(m))
+    assert c.length() == 1
+    assert captured == []  # 初始消息不触发 append
+    c.add_user("y")
+    assert len(captured) == 1
