@@ -1,25 +1,35 @@
-"""Agent：ReAct 循环编排（chap04）+ 权限五层防御（chap06）。
+"""Agent：ReAct 循环编排（chap04）+ 权限五层防御（chap06）+ 上下文管理（chap08）。
 
-每一轮：带工具定义发起请求 → 流式收集 → 若模型请求工具则执行（前置 engine.check 五层判定）
-并把结果回灌进历史 → 进入下一轮；若模型给出无工具调用的纯文本，则该文本即最终答复，循环结束。
+每一轮：上下文管理（layer1 落盘 + 必要时 layer2 摘要）→ 带工具定义发起请求 → 流式收集 →
+若模型请求工具则执行并把结果回灌 → 进入下一轮；模型给出无工具调用纯文本即最终答复。
 
 权限判定（chap06）：
-- 工具执行前调用 ``engine.check(mode, call, read_only)`` 走前四层（黑名单/沙箱/规则/模式兜底）。
-- Allow → 正常执行；Deny → 构造 is_error 的 ToolResult 回灌（不中断）；
-- Ask → 发出 ``ApprovalRequest`` 事件并 await 用户三选一。
+- 工具执行前调用 ``engine.check`` 走前四层，必要时人在回路 Ask。
+
+上下文管理（chap08）：
+- 每轮请求前调 ``manage_context``：自动路径 + 落盘子系统。
+- 流式响应若收到 ``PromptTooLongError``：紧急路径，``manage_context(EMERGENCY)`` 后
+  在同一 ``run`` 内重试一次（仅一次）；二次仍 PTL → 抛错让上层处理。
+- ``ReadFile`` 工具成功执行后把内容写进 ``recovery``（用于摘要恢复段）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from nuocode import llm, prompt
+from nuocode.agent.runtime import SessionRuntime
+from nuocode.compact import ManageInput, TriggerKind, manage_context
+from nuocode.compact.token import estimate_tokens
+from nuocode.compact.token import usage_anchor as _usage_anchor_sum
 from nuocode.conversation import Conversation
-from nuocode.llm import Provider, ToolCall, ToolResult
+from nuocode.llm import PromptTooLongError, Provider, ToolCall, ToolResult
 from nuocode.permission import Engine, Mode, Outcome
 from nuocode.tool import DEFAULT_TIMEOUT, Registry
 
@@ -35,6 +45,8 @@ NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发�
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
 NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
+NOTICE_PTL_RECOVERED = "（上下文超长，已紧急压缩并重试。）"
+NOTICE_PTL_FATAL = "（上下文超长且紧急压缩仍失败，本轮已中断。）"
 
 
 # ───────── 数据结构 ─────────
@@ -64,16 +76,21 @@ class ToolEvent:
 
 @dataclass
 class ApprovalRequest:
-    """人在回路：等待用户三选一。
-
-    TUI 收到后必须调 ``respond.set_result(Outcome.X)``，否则 agent 阻塞。
-    取消（Esc/Ctrl+C）时 TUI 兜底 ``set_result(Outcome.DENY_ONCE)`` 再触发取消。
-    """
+    """人在回路：等待用户三选一。"""
 
     name: str
     args: str
     reason: str
     respond: asyncio.Future[Outcome]
+
+
+@dataclass
+class CompactEvent:
+    """compact 通知事件：layer2 实际触发后由 Agent 发出，TUI 渲染一行简报。"""
+
+    trigger: str  # "auto" / "manual" / "emergency"
+    before_tokens: int
+    after_tokens: int
 
 
 @dataclass
@@ -86,6 +103,7 @@ class Event:
     done: bool = False
     err: Exception | None = None
     approval: ApprovalRequest | None = None
+    compact: CompactEvent | None = None
 
 
 # ───────── 辅助 ─────────
@@ -109,7 +127,7 @@ def _ensure_final(text: str) -> str:
 
 
 class Agent:
-    """持有 provider / registry / engine，执行 ReAct 循环。"""
+    """持有 provider / registry / engine / runtime，执行 ReAct 循环。"""
 
     def __init__(
         self,
@@ -117,11 +135,26 @@ class Agent:
         registry: Registry,
         version: str,
         engine: Engine,
+        runtime: SessionRuntime | None = None,
+        context_window: int = 200_000,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self._engine = engine
+        if runtime is None:
+            # 兼容老调用方：构造一个临时 runtime（不落到磁盘外，使用临时目录）
+            import tempfile
+
+            from nuocode.compact import new_session_context
+
+            runtime = SessionRuntime(session=new_session_context(tempfile.gettempdir()))
+        self._runtime = runtime
+        self._context_window = context_window
+
+    @property
+    def runtime(self) -> SessionRuntime:
+        return self._runtime
 
     async def run(
         self,
@@ -132,6 +165,16 @@ class Agent:
         if cancel is None:
             cancel = asyncio.Event()
 
+        async with self._runtime.run_lock:
+            async for ev in self._run_inner(conv, mode, cancel):
+                yield ev
+
+    async def _run_inner(
+        self,
+        conv: Conversation,
+        mode: Mode,
+        cancel: asyncio.Event,
+    ) -> AsyncIterator[Event]:
         env = prompt.gather_environment(self._version, self._provider.model)
         sys_prompt = prompt.build_system_prompt()
         env_text = env.render()
@@ -141,7 +184,8 @@ class Agent:
         else:
             defs = self._registry.definitions()
 
-        unknown_run = 0
+        # 重置该 conv 的 unknown_run 计数（重新进入 run 视为新一段会话）
+        self._unknown_run_state[id(conv)] = 0
 
         for it in range(1, MAX_ITERATIONS + 1):
             yield Event(iter=it)
@@ -150,92 +194,41 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
+            # ── 上下文管理（AUTO 路径） ──
+            try:
+                async for ev in self._run_manage_context(conv, defs, TriggerKind.AUTO):
+                    yield ev
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto manage_context failed: %s", e)
+
             reminder = ""
             if mode == Mode.PLAN:
                 full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
                 reminder = prompt.plan_reminder(full)
 
-            text_buf: list[str] = []
-            calls_buf: list[ToolCall] = []
-            usage_buf: list[Usage] = []
-            err_holder: list[Exception] = []
-
-            async for ev in self._stream_once(
-                conv,
-                defs,
-                sys_prompt,
-                env_text,
-                reminder,
-                cancel,
-                text_buf,
-                calls_buf,
-                usage_buf,
-                err_holder,
+            # 单轮 ReAct：若发出 done / 终止 notice，整个 run 结束
+            terminated = False
+            async for ev in self._drive_one_round(
+                conv, mode, defs, sys_prompt, env_text, reminder, cancel, it
             ):
                 yield ev
-
-            if err_holder:
-                yield Event(notice=NOTICE_STREAM_ERR)
-                self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                if ev.done:
+                    terminated = True
+                if ev.notice in (
+                    NOTICE_PTL_FATAL,
+                    NOTICE_STREAM_ERR,
+                    NOTICE_CANCELLED,
+                    NOTICE_UNKNOWN_TOOLS,
+                ):
+                    terminated = True
+            if terminated:
                 return
 
             if cancel.is_set():
                 self._finish_cancelled(conv)
                 return
 
-            text = "".join(text_buf)
-            calls = list(calls_buf)
-            usage = usage_buf[-1] if usage_buf else None
-
-            if usage is not None:
-                yield Event(usage=usage)
-
-            if not calls:
-                conv.add_assistant(_ensure_final(text))
-                yield Event(done=True)
-                return
-
-            conv.add_assistant_with_tool_calls(text, calls)
-
-            if self._all_unknown(calls):
-                unknown_run += 1
-            else:
-                unknown_run = 0
-
-            results: list[ToolResult | None] = [None] * len(calls)
-            completed = True
-            try:
-                async for ev in self._execute_batched(calls, mode, cancel, results):
-                    yield ev
-            except asyncio.CancelledError:
-                # 取消收尾
-                completed = False
-                for k, c in enumerate(calls):
-                    if results[k] is None:
-                        results[k] = ToolResult(
-                            tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
-                        )
-                real_results: list[ToolResult] = [r for r in results if r is not None]
-                conv.add_tool_results(real_results)
-                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
-                raise
-
-            if any(r is None for r in results):
-                completed = False
-                for k, c in enumerate(calls):
-                    if results[k] is None:
-                        results[k] = ToolResult(
-                            tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
-                        )
-
-            real_results = [r for r in results if r is not None]
-            conv.add_tool_results(real_results)
-
-            if not completed:
-                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
-                return
-
-            if unknown_run >= MAX_UNKNOWN_RUN:
+            if self._unknown_run_state.get(id(conv), 0) >= MAX_UNKNOWN_RUN:
                 yield Event(notice=NOTICE_UNKNOWN_TOOLS)
                 self._ensure_assistant_tail(conv, NOTICE_UNKNOWN_TOOLS)
                 yield Event(done=True)
@@ -245,7 +238,138 @@ class Agent:
         self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield Event(done=True)
 
-    async def _stream_once(
+    # 简化：用一个轻量 dict 跟踪 unknown_run（多 conv 隔离）
+    _unknown_run_state: dict[int, int] = {}
+
+    async def _drive_one_round(
+        self,
+        conv: Conversation,
+        mode: Mode,
+        defs,
+        sys_prompt: str,
+        env_text: str,
+        reminder: str,
+        cancel: asyncio.Event,
+        iter_no: int,
+    ) -> AsyncIterator[Event]:
+        """驱动单轮 ReAct：stream → 工具执行 → 必要时 PTL 紧急重试。"""
+
+        # 第一次尝试
+        text, calls, usage, err = "", [], None, None
+        async for ev in self._stream_once_gen(conv, defs, sys_prompt, env_text, reminder, cancel):
+            if ev.err is not None:
+                err = ev.err
+                break
+            if ev.text:
+                yield Event(text=ev.text)
+                text += ev.text
+            if ev.tool:
+                pass  # 不会发生
+            if isinstance(getattr(ev, "_calls", None), list):
+                calls = ev._calls  # type: ignore[attr-defined]
+            if ev.usage is not None:
+                usage = ev.usage
+
+        # 处理 PTL：紧急路径重试 1 次
+        if isinstance(err, PromptTooLongError):
+            try:
+                async for ev in self._run_manage_context(conv, defs, TriggerKind.EMERGENCY):
+                    yield ev
+            except Exception as e:  # noqa: BLE001
+                logger.warning("emergency compact failed: %s", e)
+                yield Event(notice=NOTICE_PTL_FATAL, err=err)
+                self._ensure_assistant_tail(conv, NOTICE_PTL_FATAL)
+                return
+
+            yield Event(notice=NOTICE_PTL_RECOVERED)
+            text, calls, usage, err = "", [], None, None
+            async for ev in self._stream_once_gen(
+                conv, defs, sys_prompt, env_text, reminder, cancel
+            ):
+                if ev.err is not None:
+                    err = ev.err
+                    break
+                if ev.text:
+                    yield Event(text=ev.text)
+                    text += ev.text
+                if isinstance(getattr(ev, "_calls", None), list):
+                    calls = ev._calls  # type: ignore[attr-defined]
+                if ev.usage is not None:
+                    usage = ev.usage
+
+        if err is not None:
+            yield Event(notice=NOTICE_STREAM_ERR, err=err)
+            self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+            return
+
+        if cancel.is_set():
+            self._finish_cancelled(conv)
+            yield Event(notice=NOTICE_CANCELLED)
+            return
+
+        if usage is not None:
+            # 回写 anchor：以"主对话路径 stream 尾"为唯一锚点
+            self._runtime.usage_anchor = _usage_anchor_sum(usage)
+            self._runtime.anchor_msg_len = conv.length()
+            yield Event(
+                usage=Usage(
+                    input=usage.input_tokens,
+                    output=usage.output_tokens,
+                    cache_write=usage.cache_write,
+                    cache_read=usage.cache_read,
+                )
+            )
+
+        if not calls:
+            conv.add_assistant(_ensure_final(text))
+            yield Event(done=True)
+            return
+
+        conv.add_assistant_with_tool_calls(text, calls)
+
+        if self._all_unknown(calls):
+            self._unknown_run_state[id(conv)] = self._unknown_run_state.get(id(conv), 0) + 1
+        else:
+            self._unknown_run_state[id(conv)] = 0
+
+        results: list[ToolResult | None] = [None] * len(calls)
+        completed = True
+        try:
+            async for ev in self._execute_batched(calls, mode, cancel, results):
+                yield ev
+        except asyncio.CancelledError:
+            completed = False
+            for k, c in enumerate(calls):
+                if results[k] is None:
+                    results[k] = ToolResult(
+                        tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
+                    )
+            real_results: list[ToolResult] = [r for r in results if r is not None]
+            conv.add_tool_results(real_results)
+            self._track_file_reads(calls, real_results)
+            self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+            raise
+
+        if any(r is None for r in results):
+            completed = False
+            for k, c in enumerate(calls):
+                if results[k] is None:
+                    results[k] = ToolResult(
+                        tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
+                    )
+
+        real_results = [r for r in results if r is not None]
+        conv.add_tool_results(real_results)
+        self._track_file_reads(calls, real_results)
+
+        if not completed:
+            self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+            yield Event(notice=NOTICE_CANCELLED)
+            return
+
+    # ───────── 内部：stream + manage_context ─────────
+
+    async def _stream_once_gen(
         self,
         conv: Conversation,
         defs,
@@ -253,46 +377,150 @@ class Agent:
         env_text: str,
         reminder: str,
         cancel: asyncio.Event,
-        text_buf: list[str],
-        calls_buf: list[ToolCall],
-        usage_buf: list[Usage],
-        err_holder: list[Exception],
     ) -> AsyncIterator[Event]:
+        """单轮 stream：把 Provider 事件翻译成本模块 Event；calls 通过 ``ev._calls`` 私有属性回传。"""
+
         req = llm.Request(
             messages=conv.messages(),
             tools=defs,
             system=llm.System(stable=sys_prompt, environment=env_text),
             reminder=reminder,
         )
+        calls_buf: list[ToolCall] = []
         try:
             async for ev in self._provider.stream(req):
                 if cancel.is_set():
                     return
                 if ev.err is not None:
-                    err_holder.append(ev.err)
                     yield Event(err=ev.err)
                     return
                 if ev.text:
-                    text_buf.append(ev.text)
                     yield Event(text=ev.text)
                 if ev.tool_calls:
                     calls_buf.extend(ev.tool_calls)
                 if ev.usage is not None:
-                    usage_buf.append(
-                        Usage(
-                            input=ev.usage.input_tokens,
-                            output=ev.usage.output_tokens,
+                    out = Event(
+                        usage=llm.Usage(
+                            input_tokens=ev.usage.input_tokens,
+                            output_tokens=ev.usage.output_tokens,
                             cache_write=ev.usage.cache_write,
                             cache_read=ev.usage.cache_read,
                         )
                     )
+                    yield out
                 if ev.done:
+                    out = Event()
+                    out._calls = list(calls_buf)  # type: ignore[attr-defined]
+                    yield out
                     return
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            err_holder.append(e)
             yield Event(err=e)
+
+    async def _run_manage_context(
+        self,
+        conv: Conversation,
+        defs,
+        trigger: TriggerKind,
+    ) -> AsyncIterator[Event]:
+        """共享 compact 入口：把估算 → manage_context → CompactEvent 串起来。"""
+        msgs = conv.messages()
+        est = estimate_tokens(
+            self._runtime.usage_anchor, msgs, self._runtime.anchor_msg_len
+        )
+        in_ = ManageInput(
+            conv=conv,
+            provider=self._provider,
+            context_window=self._context_window,
+            tool_defs=list(defs),
+            replacement=self._runtime.replacement,
+            recovery=self._runtime.recovery,
+            auto_tracking=self._runtime.auto_tracking,
+            session=self._runtime.session,
+            usage_anchor=self._runtime.usage_anchor,
+            anchor_msg_len=self._runtime.anchor_msg_len,
+            estimated_token=est,
+            trigger=trigger,
+        )
+        out = await manage_context(in_)
+        # 仅在 layer2 真正发生时发 CompactEvent。
+        # AUTO 分支即使只跑了 layer1，after_tokens 可能仍 < before_tokens；
+        # 但 manage_context 现状下 AUTO 没触发 layer2 时 after_tokens = est_tokens（layer1 后估算），
+        # before_tokens = 入口 estimated_token（layer1 前估算）。两者可能相等也可能不等。
+        # 因此用一个保守判定：手动 / 紧急一律通知；自动仅在 message 数量真的减少时通知。
+        layer2_happened = False
+        if trigger == TriggerKind.MANUAL or trigger == TriggerKind.EMERGENCY:
+            layer2_happened = True
+        else:
+            # AUTO：检查熔断 + 阈值；用 ``conv.length()`` 简化判断—
+            # layer2 后必产出"摘要 + (assistant 桥) + 近期"少量条数。
+            # 这里用 after_tokens 与 before_tokens 的相对差距 + 阈值判定即可。
+            from nuocode.compact.const import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE
+
+            threshold = self._context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
+            layer2_happened = (
+                out.before_tokens >= threshold
+                and out.after_tokens < out.before_tokens
+                and not self._runtime.auto_tracking.tripped()
+            )
+
+        if layer2_happened:
+            yield Event(
+                compact=CompactEvent(
+                    trigger=trigger.value,
+                    before_tokens=out.before_tokens,
+                    after_tokens=out.after_tokens,
+                )
+            )
+            self._runtime.usage_anchor = 0
+            self._runtime.anchor_msg_len = conv.length()
+
+    async def run_force_compact(self, conv: Conversation) -> AsyncIterator[Event]:
+        """TUI ``/compact`` 入口：手动路径，与 ``run`` 互斥。"""
+        async with self._runtime.run_lock:
+            defs = self._registry.definitions()
+            try:
+                async for ev in self._run_manage_context(conv, defs, TriggerKind.MANUAL):
+                    yield ev
+            except Exception as e:  # noqa: BLE001
+                yield Event(err=e, notice=NOTICE_STREAM_ERR)
+
+    # ───────── 文件追踪 ─────────
+
+    def _track_file_reads(
+        self, calls: list[ToolCall], results: list[ToolResult]
+    ) -> None:
+        """把 ``ReadFile`` 工具的成功结果写进 RecoveryState。
+
+        约定：``ReadFile`` 工具入参 JSON 中带 ``path`` 字段；结果为带行号前缀的文本。
+        本方法去掉行号前缀（``\\d+→`` 模式），仅存纯净内容。
+        """
+        import re
+
+        prefix_re = re.compile(r"^\s*\d+→", re.MULTILINE)
+        by_id = {c.id: c for c in calls}
+        for r in results:
+            if r.is_error:
+                continue
+            c = by_id.get(r.tool_call_id)
+            if c is None or c.name != "ReadFile":
+                continue
+            try:
+                args = json.loads(c.input or "{}")
+            except json.JSONDecodeError:
+                continue
+            path = args.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                abs_path = str(Path(path).resolve())
+            except OSError:
+                abs_path = path
+            cleaned = prefix_re.sub("", r.content or "")
+            self._runtime.recovery.record_file(abs_path, cleaned)
+
+    # ───────── 工具批量执行（保持原实现） ─────────
 
     async def _execute_batched(
         self,
@@ -310,18 +538,15 @@ class Agent:
             if cancel.is_set():
                 return
             if self._registry.is_read_only(calls[i].name):
-                # 吃最长连续只读区间
                 j = i
                 while j < n and self._registry.is_read_only(calls[j].name):
                     j += 1
 
                 previews = [_preview_args(calls[k].input) for k in range(i, j)]
-                # 先为每个只读调用做权限预判（只读永不 Ask；可能 Allow / Deny）
                 decisions: list[tuple[Decision, str]] = []
                 for k in range(i, j):
                     decisions.append(self._engine.check(mode, calls[k], True))
 
-                # 按序发 PHASE_START
                 for k in range(i, j):
                     yield Event(
                         tool=ToolEvent(
@@ -331,7 +556,6 @@ class Agent:
                         )
                     )
 
-                # 分流：Allow 进 gather；Deny 直接置结果
                 tasks: dict[int, asyncio.Task] = {}
                 for k in range(i, j):
                     d, reason = decisions[k - i]
@@ -350,7 +574,6 @@ class Agent:
                             is_error=res.is_error,
                         )
 
-                # 按序发 PHASE_END
                 for k in range(i, j):
                     r = results[k]
                     assert r is not None
@@ -365,7 +588,6 @@ class Agent:
                     )
                 i = j
             else:
-                # 串行单个：先权限判定
                 preview = _preview_args(calls[i].input)
                 yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
 
@@ -381,7 +603,6 @@ class Agent:
                 elif decision == Decision.DENY:
                     results[i] = ToolResult(tool_call_id=calls[i].id, content=reason, is_error=True)
                 else:
-                    # Ask：人在回路 —— 在 generator 内 yield ApprovalRequest 事件
                     loop = asyncio.get_running_loop()
                     respond: asyncio.Future[Outcome] = loop.create_future()
                     req = ApprovalRequest(
@@ -394,7 +615,6 @@ class Agent:
                     try:
                         outcome = await respond
                     except asyncio.CancelledError:
-                        # 上层会捕获 → 取消收尾
                         raise
                     if outcome == Outcome.DENY_ONCE:
                         results[i] = ToolResult(
@@ -451,13 +671,17 @@ __all__ = [
     "PLAN_REMINDER_INTERVAL",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",
+    "NOTICE_PTL_FATAL",
+    "NOTICE_PTL_RECOVERED",
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
     "Agent",
     "ApprovalRequest",
+    "CompactEvent",
     "Event",
     "Mode",
     "Phase",
+    "SessionRuntime",
     "ToolEvent",
     "Usage",
 ]

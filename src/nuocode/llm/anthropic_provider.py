@@ -13,12 +13,28 @@ from nuocode.config import ProviderConfig
 from nuocode.llm import (
     ROLE_TOOL,
     Message,
+    PromptTooLongError,
     Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
+
+
+def _is_prompt_too_long(exc: Exception) -> bool:
+    """Anthropic："prompt is too long" / "context length"。"""
+    text = str(exc).lower()
+    if "prompt is too long" in text or "context length" in text:
+        return True
+    # SDK BadRequestError.body 里的 error.type 也可能是 invalid_request_error
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        msg = str(err.get("message", "")).lower()
+        if "prompt is too long" in msg or "context length" in msg:
+            return True
+    return False
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -204,4 +220,7 @@ class AnthropicProvider:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            yield StreamEvent(err=e)
+            if _is_prompt_too_long(e):
+                yield StreamEvent(err=PromptTooLongError(str(e), cause=e))
+            else:
+                yield StreamEvent(err=e)

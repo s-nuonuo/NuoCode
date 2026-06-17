@@ -19,6 +19,8 @@ build/
 # nuocode 本地配置（含密钥）
 .nuocode/config.yaml
 .nuocode/settings.local.yaml
+# nuocode 会话落盘（chap08：tool-result spill 目录与会话状态）
+.nuocode/sessions/
 
 # docs
 docs/

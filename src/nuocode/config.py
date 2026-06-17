@@ -12,6 +12,19 @@ Protocol = Literal["anthropic", "openai"]
 _VALID_PROTOCOLS: set[str] = {"anthropic", "openai"}
 
 
+# ───────── 协议默认 context_window（兜底值） ─────────
+# 仅在配置未填 ``context_window`` 时使用。具体模型上限请通过 yaml 显式声明。
+
+_DEFAULT_CONTEXT_WINDOW: dict[str, int] = {
+    "anthropic": 200_000,
+    "openai": 128_000,
+}
+
+
+def default_context_window(protocol: str) -> int:
+    return _DEFAULT_CONTEXT_WINDOW.get(protocol, 128_000)
+
+
 class ConfigError(Exception):
     """配置文件不存在、解析失败或字段非法时抛出。"""
 
@@ -24,6 +37,14 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     thinking: bool = False
+    # 模型上下文窗口 token 数；未配置时用 ``default_context_window(protocol)``。
+    context_window: int | None = None
+
+    def effective_context_window(self) -> int:
+        """返回生效的 context_window：显式配置优先，否则取协议兜底值。"""
+        if self.context_window is not None and self.context_window > 0:
+            return self.context_window
+        return default_context_window(self.protocol)
 
 
 @dataclass
@@ -69,6 +90,14 @@ def _from_dict(raw: Any) -> Config:
         if not isinstance(thinking, bool):
             raise ConfigError(f"{prefix}.thinking 必须是布尔值")
 
+        ctx_raw = item.get("context_window")
+        if ctx_raw is None:
+            context_window: int | None = None
+        else:
+            if not isinstance(ctx_raw, int) or isinstance(ctx_raw, bool) or ctx_raw <= 0:
+                raise ConfigError(f"{prefix}.context_window 必须是正整数或省略")
+            context_window = ctx_raw
+
         providers.append(
             ProviderConfig(
                 name=name,
@@ -77,6 +106,7 @@ def _from_dict(raw: Any) -> Config:
                 model=model,
                 base_url=base_url,
                 thinking=thinking,
+                context_window=context_window,
             )
         )
 

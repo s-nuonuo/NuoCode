@@ -18,6 +18,8 @@ async def _amain() -> int:
 
     from nuocode import mcp as mcp_client
     from nuocode import permission
+    from nuocode.agent.runtime import SessionRuntime
+    from nuocode.compact import new_session_context
     from nuocode.tool import new_default_registry
     from nuocode.tui.app import NuoCodeApp
 
@@ -27,6 +29,10 @@ async def _amain() -> int:
         print(f"[nuocode] 权限引擎降级: {perm_err}", file=sys.stderr)
 
     registry = new_default_registry()
+
+    # ── 会话上下文 + 运行时容器（chap08） ──
+    session = new_session_context(root)
+    runtime = SessionRuntime(session=session)
 
     mcp_cfg = mcp_client.load_config(root)
     try:
@@ -42,7 +48,7 @@ async def _amain() -> int:
             except ValueError as e:
                 print(f"[mcp] warn: {e}", file=sys.stderr)
 
-        app = NuoCodeApp(cfg.providers, registry, engine)
+        app = NuoCodeApp(cfg.providers, registry, engine, runtime)
         try:
             await app.run_async()
         except KeyboardInterrupt:

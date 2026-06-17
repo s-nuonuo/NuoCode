@@ -11,12 +11,32 @@ import openai
 from nuocode.config import ProviderConfig
 from nuocode.llm import (
     ROLE_TOOL,
+    PromptTooLongError,
     Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
+
+
+def _is_prompt_too_long(exc: Exception) -> bool:
+    """OpenAI/兼容端点：``context_length_exceeded`` / "maximum context length"。"""
+    text = str(exc).lower()
+    if "context_length_exceeded" in text or "maximum context length" in text:
+        return True
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code == "context_length_exceeded":
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        if str(err.get("code", "")) == "context_length_exceeded":
+            return True
+        msg = str(err.get("message", "")).lower()
+        if "context_length_exceeded" in msg or "maximum context length" in msg:
+            return True
+    return False
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -176,4 +196,7 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            yield StreamEvent(err=e)
+            if _is_prompt_too_long(e):
+                yield StreamEvent(err=PromptTooLongError(str(e), cause=e))
+            else:
+                yield StreamEvent(err=e)

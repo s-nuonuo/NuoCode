@@ -17,6 +17,21 @@ ROLE_TOOL = "tool"  # 携带工具执行结果的回合
 Role = Literal["user", "assistant", "tool"]
 
 
+# ───────── 错误 ─────────
+
+
+class PromptTooLongError(Exception):
+    """provider 层把"上下文超长"统一抛出的协议无关错误。
+
+    各适配器在捕获到协议特异的"prompt too long"错误时，包装成本类型再抛
+    （或通过 ``StreamEvent.err`` 投递）。compact 包据此判定是否进入紧急路径。
+    """
+
+    def __init__(self, message: str = "prompt too long", *, cause: Exception | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
 # ───────── 工具相关类型 ─────────
 
 
@@ -159,6 +174,7 @@ __all__ = [
     "ROLE_TOOL",
     "ROLE_USER",
     "Message",
+    "PromptTooLongError",
     "Provider",
     "Request",
     "Role",

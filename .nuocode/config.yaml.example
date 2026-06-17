@@ -1,0 +1,22 @@
+# nuocode provider 配置示例（chap08 起新增 context_window 字段）
+#
+# - 单个 provider 时启动直接进入对话；多个时呈现选择列表。
+# - context_window 仅对 chap08 上下文管理（自动摘要阈值）生效；省略时按 protocol 取兜底：
+#     anthropic: 200_000   openai: 128_000
+#
+# 真实模型上限请通过本字段显式声明（或保持默认兜底，以你部署的模型为准）。
+providers:
+  - name: claude-sonnet
+    protocol: anthropic
+    api_key: sk-ant-REPLACE_ME
+    model: claude-sonnet-4
+    thinking: true
+    # base_url: https://api.anthropic.com   # 默认即可
+    context_window: 200000
+
+  - name: deepseek-v4-pro
+    protocol: openai
+    api_key: sk-REPLACE_ME
+    model: deepseek-v4-pro
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    context_window: 128000

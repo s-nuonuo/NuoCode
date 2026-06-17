@@ -15,8 +15,8 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from nuocode import __version__
-from nuocode import prompt as prompt_mod
 from nuocode.agent import Agent, ApprovalRequest, Phase
+from nuocode.agent.runtime import SessionRuntime
 from nuocode.config import ProviderConfig
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, new_provider
@@ -105,11 +105,19 @@ class NuoCodeApp(App):
         providers: list[ProviderConfig],
         registry: Registry,
         engine: Engine,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
         self.registry: Registry = registry
         self.engine: Engine = engine
+        if runtime is None:
+            import tempfile
+
+            from nuocode.compact import new_session_context
+
+            runtime = SessionRuntime(session=new_session_context(tempfile.gettempdir()))
+        self.runtime: SessionRuntime = runtime
         self.provider: Provider | None = None
         self.agent: Agent | None = None
         self.conv: Conversation = Conversation()
@@ -167,7 +175,14 @@ class NuoCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
-        self.agent = Agent(self.provider, self.registry, __version__, self.engine)
+        self.agent = Agent(
+            self.provider,
+            self.registry,
+            __version__,
+            self.engine,
+            self.runtime,
+            cfg.effective_context_window(),
+        )
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:
@@ -213,29 +228,43 @@ class NuoCodeApp(App):
     def post_submit(self, text: str) -> None:
         if self.state is not SessionState.IDLE:
             return
-        stripped = text.strip()
-        if stripped == "/exit":
-            self.exit()
-            return
         if self.agent is None:
             return
 
-        log = self.query_one("#log", RichLog)
+        from nuocode.tui import commands as cmd_mod
 
-        if stripped == "/plan":
-            self.mode = Mode.PLAN
-            log.write("● 已进入计划模式（仅只读工具）。用 /do 切回并执行。")
-            self._refresh_statusbar()
+        if cmd_mod.is_command(text):
+            cmd_mod.dispatch(self, text)
             return
-        if stripped == "/do":
-            self.mode = Mode.DEFAULT
-            self.conv.add_user(prompt_mod.EXECUTE_DIRECTIVE)
-            log.write(user_block(prompt_mod.EXECUTE_DIRECTIVE))
-        else:
-            log.write(user_block(text))
-            self.conv.add_user(text)
 
+        log = self.query_one("#log", RichLog)
+        log.write(user_block(text))
+        self.conv.add_user(text)
         self._start_turn()
+
+    def start_force_compact(self) -> None:
+        """``/compact`` 命令入口：以异步任务跑 ``Agent.run_force_compact``。"""
+        if self.agent is None or self.state is not SessionState.IDLE:
+            return
+        asyncio.create_task(self._do_force_compact())
+
+    async def _do_force_compact(self) -> None:
+        assert self.agent is not None
+        log = self.query_one("#log", RichLog)
+        try:
+            async for ev in self.agent.run_force_compact(self.conv):
+                if ev.err is not None:
+                    log.write(error_block(ev.err))
+                    continue
+                if ev.compact is not None:
+                    log.write(
+                        f"● [compact:{ev.compact.trigger}] "
+                        f"{ev.compact.before_tokens} → {ev.compact.after_tokens} tokens"
+                    )
+                if ev.notice:
+                    log.write(f"● {ev.notice}")
+        except Exception as e:  # noqa: BLE001
+            log.write(error_block(e))
 
     def _start_turn(self) -> None:
         self.cur_reply = ""
@@ -318,6 +347,11 @@ class NuoCodeApp(App):
                     self._refresh_statusbar()
                 if ev.notice:
                     log.write(f"● {ev.notice}")
+                if ev.compact is not None:
+                    log.write(
+                        f"● [compact:{ev.compact.trigger}] "
+                        f"{ev.compact.before_tokens} → {ev.compact.after_tokens} tokens"
+                    )
                 if ev.iter > 0:
                     self.iter = ev.iter
                     self._refresh_streaming_view()
