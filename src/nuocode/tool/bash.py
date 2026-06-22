@@ -11,6 +11,7 @@ from nuocode.tool import Result, _truncate
 
 class BashTool:
     read_only = False
+    is_system = False
 
     def name(self) -> str:
         return "bash"

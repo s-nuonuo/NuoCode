@@ -36,7 +36,7 @@ def test_menu_filters_by_prefix_s() -> None:
     m.update("/s", _full_reg())
     assert m.active
     names = [c.name for c in m.items]
-    assert names == ["session", "status"]
+    assert names == ["session", "skill", "status"]
 
 
 def test_menu_no_match_shows_empty_active() -> None:

@@ -28,9 +28,11 @@ class Tool(Protocol):
     """统一工具抽象（F1）。
 
     ``read_only``：True 表示只读工具（可并发执行 & Plan Mode 放行）。
+    ``is_system``：chap11 系统工具标记（不受 allowed_tools 约束）。
     """
 
     read_only: bool
+    is_system: bool
 
     def name(self) -> str: ...
 
@@ -71,6 +73,13 @@ class Registry:
         self._order.append(n)
         self._tools[n] = tool
 
+    def register_skill_tool(self, tool: Tool) -> None:
+        """chap11：Skill 专属工具动态注册，重复名静默覆盖。"""
+        n = tool.name()
+        if n not in self._tools:
+            self._order.append(n)
+        self._tools[n] = tool
+
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
@@ -108,6 +117,30 @@ class Registry:
         """分批判定；未知工具返回 False（按串行处理）。"""
         t = self._tools.get(name)
         return t is not None and bool(getattr(t, "read_only", False))
+
+    def is_system(self, name: str) -> bool:
+        """chap11：系统工具判定。"""
+        t = self._tools.get(name)
+        return t is not None and bool(getattr(t, "is_system", False))
+
+    def definitions_filtered(self, allowed: list[str]) -> list[ToolDefinition]:
+        """chap11：按白名单 + 系统工具豁免导出定义。
+
+        allowed 为空列表时仅导出系统工具。
+        """
+        allowset = set(allowed or [])
+        out: list[ToolDefinition] = []
+        for n in self._order:
+            t = self._tools[n]
+            if n in allowset or bool(getattr(t, "is_system", False)):
+                out.append(
+                    ToolDefinition(
+                        name=n,
+                        description=t.description(),
+                        input_schema=t.parameters(),
+                    )
+                )
+        return out
 
     async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
         tool = self._tools.get(name)

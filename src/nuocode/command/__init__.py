@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from nuocode.command.builtins import REVIEW_DIRECTIVE, register_builtins
+from nuocode.command.builtins import register_builtins
 from nuocode.command.command import Command, Handler, Kind
 from nuocode.command.dispatch import parse
 from nuocode.command.registry import Registry
 from nuocode.command.ui import UI, NopUI
 
 __all__ = [
-    "REVIEW_DIRECTIVE",
     "Command",
     "Handler",
     "Kind",

@@ -44,6 +44,14 @@ class UI(Protocol):
     # 状态机查询
     def idle(self) -> bool: ...
 
+    # chap11: skills
+    def list_catalog_skills(self) -> list[tuple[str, str, str]]: ...
+    def list_active_skills(self) -> list[str]: ...
+    def clear_active_skills(self) -> None: ...
+    def append_assistant_message(self, text: str) -> None: ...
+    def recent_messages(self, n: int) -> list: ...
+    def all_messages(self) -> list: ...
+
 
 class NopUI:
     """测试桩：所有写入方法 no-op；查询返回零值。"""
@@ -99,6 +107,25 @@ class NopUI:
 
     def idle(self) -> bool:
         return True
+
+    # chap11 skills no-op
+    def list_catalog_skills(self) -> list[tuple[str, str, str]]:
+        return []
+
+    def list_active_skills(self) -> list[str]:
+        return []
+
+    def clear_active_skills(self) -> None:
+        return None
+
+    def append_assistant_message(self, text: str) -> None:
+        return None
+
+    def recent_messages(self, n: int) -> list:
+        return []
+
+    def all_messages(self) -> list:
+        return []
 
 
 __all__ = ["NopUI", "UI"]

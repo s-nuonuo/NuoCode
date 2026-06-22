@@ -66,10 +66,30 @@ async def handle_session(ui: UI) -> None:
     ui.println(f"Session: {sid}\nPath: {path}")
 
 
+async def handle_skill(ui: UI) -> None:
+    """chap11 ``/skill``：列出 Catalog 与已激活 Skill。"""
+    items = ui.list_catalog_skills()
+    active = set(ui.list_active_skills())
+    if not items:
+        ui.println("未发现任何 Skill")
+        return
+    lines = ["Skill Catalog:"]
+    name_w = max(len(n) for n, _, _ in items)
+    for name, source, desc in items:
+        marker = "*" if name in active else " "
+        src_label = f"[{source}]".ljust(10)
+        lines.append(f" {marker} /{name.ljust(name_w)}  {src_label} {desc}")
+    if active:
+        lines.append("")
+        lines.append("已激活: " + ", ".join(sorted(active)))
+    ui.println("\n".join(lines))
+
+
 __all__ = [
     "handle_memory",
     "handle_permission",
     "handle_session",
+    "handle_skill",
     "handle_status",
     "make_help_handler",
 ]

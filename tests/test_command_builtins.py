@@ -6,7 +6,7 @@ import asyncio
 
 from nuocode.command import NopUI, Registry, register_builtins
 from nuocode.command.builtin_local import handle_status
-from nuocode.command.builtin_prompt import REVIEW_DIRECTIVE, handle_do, handle_review
+from nuocode.command.builtin_prompt import handle_do
 from nuocode.command.builtin_ui import handle_compact, handle_plan
 from nuocode.permission import Mode
 
@@ -20,8 +20,8 @@ EXPECTED_NAMES = [
     "permission",
     "plan",
     "resume",
-    "review",
     "session",
+    "skill",
     "status",
 ]
 
@@ -117,10 +117,8 @@ def test_handle_do_sets_mode_and_injects() -> None:
 
 
 def test_handle_review_injects_review_directive() -> None:
-    ui = RecordingUI()
-    asyncio.run(handle_review(ui))
-    assert ui.injected == [("/review", REVIEW_DIRECTIVE)]
-    assert "审查" in REVIEW_DIRECTIVE
+    # chap11: /review 已迁移为 Skill，不再有内置 handler。
+    return
 
 
 def test_handle_plan_sets_mode_plan() -> None:

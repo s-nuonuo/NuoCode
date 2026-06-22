@@ -86,16 +86,19 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
-    """三个可选槽：自定义指令(80) / 已激活 Skill(90) / 长期记忆(100)。
+def optional_modules(
+    instructions: str = "", memory: str = "", skills_catalog: str = ""
+) -> list[Module]:
+    """三个可选槽：自定义指令(80) / Skill 目录(90) / 长期记忆(100)。
 
     - ``instructions`` 非空 → custom-instructions 模块填入对应文本。
+    - ``skills_catalog`` 非空 → skills-catalog 模块填入对应文本（chap11）。
     - ``memory`` 非空 → long-term-memory 模块填入对应文本。
     - 任一为空时对应模块 ``content`` 保持空字符串，装配时被跳过。
     """
     return [
         Module(name="custom_instructions", priority=80, content=instructions or ""),
-        Module(name="active_skills", priority=90, content=""),
+        Module(name="skills_catalog", priority=90, content=skills_catalog or ""),
         Module(name="long_term_memory", priority=100, content=memory or ""),
     ]
 

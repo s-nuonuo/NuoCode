@@ -39,5 +39,20 @@ class Registry:
             return list(self._visible)
         return [c for c in self._visible if c.name.startswith(p)]
 
+    def remove_if(self, pred) -> int:  # noqa: ANN001
+        """chap11：按谓词移除命令（用于 Skill catalog reload 前先清除旧 skill 命令）。"""
+        to_remove = [c for c in self._by_name.values() if pred(c)]
+        seen: set[str] = set()
+        count = 0
+        for cmd in to_remove:
+            if cmd.name in seen:
+                continue
+            seen.add(cmd.name)
+            count += 1
+            for key in (cmd.name, *cmd.aliases):
+                self._by_name.pop(key, None)
+        self._visible = [c for c in self._visible if not pred(c)]
+        return count
+
 
 __all__ = ["Registry"]

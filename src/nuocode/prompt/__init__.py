@@ -13,6 +13,12 @@ from __future__ import annotations
 from nuocode.prompt.environment import Environment, gather_environment
 from nuocode.prompt.modules import Module, fixed_modules, optional_modules
 from nuocode.prompt.reminder import EXECUTE_DIRECTIVE, plan_reminder, system_reminder
+from nuocode.prompt.skills_block import (
+    ActiveSkillEntry,
+    SkillCatalogItem,
+    render_active_skills_block,
+    render_skills_catalog,
+)
 
 
 def assemble_system(mods: list[Module]) -> str:
@@ -22,14 +28,19 @@ def assemble_system(mods: list[Module]) -> str:
     return "\n\n".join(parts)
 
 
-def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+def build_system_prompt(
+    instructions: str = "", memory: str = "", skills_catalog: str = ""
+) -> str:
     """装配完整稳定系统提示（七固定模块 + 三可选槽）。
 
     - ``instructions``：项目指令文件（nuocode.md）拼接后的文本，注入 priority 80。
+    - ``skills_catalog``：chap11 Skill 第一阶段列表文本，注入 priority 90。
     - ``memory``：长期记忆索引文本，注入 priority 100。
     - 任一参数为空字符串时对应模块跳过（与 ch08 行为一致）。
     """
-    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
+    return assemble_system(
+        fixed_modules() + optional_modules(instructions, memory, skills_catalog)
+    )
 
 
 # ───────── 启动横幅（保留） ─────────
@@ -62,17 +73,21 @@ def render_banner(version: str, cwd: str) -> str:
 
 
 __all__ = [
+    "ActiveSkillEntry",
     "CAT_BANNER",
     "EXECUTE_DIRECTIVE",
     "Environment",
     "Module",
     "READY_HINT",
+    "SkillCatalogItem",
     "assemble_system",
     "build_system_prompt",
     "fixed_modules",
     "gather_environment",
     "optional_modules",
     "plan_reminder",
+    "render_active_skills_block",
     "render_banner",
+    "render_skills_catalog",
     "system_reminder",
 ]

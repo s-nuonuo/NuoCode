@@ -31,6 +31,12 @@ from nuocode.compact.token import usage_anchor as _usage_anchor_sum
 from nuocode.conversation import Conversation
 from nuocode.llm import PromptTooLongError, Provider, ToolCall, ToolResult
 from nuocode.permission import Engine, Mode, Outcome
+from nuocode.prompt.skills_block import (
+    ActiveSkillEntry,
+    SkillCatalogItem,
+    render_active_skills_block,
+    render_skills_catalog,
+)
 from nuocode.tool import DEFAULT_TIMEOUT, Registry
 
 logger = logging.getLogger(__name__)
@@ -158,6 +164,25 @@ class Agent:
         self._instruction_text = instruction_text
         self._memory_text = memory_text
         self._turn_count = 0
+        # chap11：Skill catalog（可选）与全量工具注册表（fork 场景使用）
+        self._catalog = None
+        self._full_registry: Registry | None = None
+
+    def with_catalog(self, catalog) -> Agent:  # noqa: ANN001
+        """chap11：注入 Skill catalog。返回 self 以便链式调用。"""
+        self._catalog = catalog
+        return self
+
+    def with_filtered_registry(self, full: Registry) -> Agent:
+        """chap11：fork 子 Agent 场景使用：保留完整 registry 引用以便后续反向查找。"""
+        self._full_registry = full
+        return self
+
+    def activate_skill(self, name: str, body: str) -> None:
+        self._runtime.active_skills.activate(name, body)
+
+    def clear_active_skills(self) -> None:
+        self._runtime.active_skills.clear()
 
     @property
     def runtime(self) -> SessionRuntime:
@@ -183,8 +208,24 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         env = prompt.gather_environment(self._version, self._provider.model)
-        sys_prompt = prompt.build_system_prompt(self._instruction_text, self._memory_text)
+        # chap11：skills_catalog 注入稳定 system prompt（需代码体中保持稳定缓存前缀）
+        skills_catalog_text = ""
+        if self._catalog is not None:
+            items = [
+                SkillCatalogItem(name=s.meta.name, description=s.meta.description)
+                for s in self._catalog.list()
+            ]
+            skills_catalog_text = render_skills_catalog(items)
+        sys_prompt = prompt.build_system_prompt(
+            self._instruction_text, self._memory_text, skills_catalog_text
+        )
+        # chap11：active skills 注入动态 env（每轮重建）
+        active_block = render_active_skills_block(
+            [ActiveSkillEntry(name=e.name, body=e.body) for e in self._runtime.active_skills.snapshot()]
+        )
         env_text = env.render()
+        if active_block:
+            env_text = env_text + "\n\n" + active_block
 
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()

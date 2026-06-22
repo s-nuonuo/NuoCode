@@ -54,9 +54,30 @@ async def _amain() -> int:
         print(f"[nuocode] 权限引擎降级: {perm_err}", file=sys.stderr)
     registry = new_default_registry()
 
+    # ── chap11: Skills 装配 ──
+    from nuocode.skills import ActiveSkills, Catalog, Executor
+    from nuocode.tool.install_skill import InstallSkillTool
+    from nuocode.tool.load_skill import LoadSkillTool
+
+    catalog = Catalog.load(Path(root))
+    active_skills = ActiveSkills()
+    # fail-fast 工具白名单校验
+    issues = catalog.validate_tools(registry)
+    for it in issues:
+        print(
+            f"[skills] error: skill {it.skill_name!r} requires unknown tool {it.tool_name!r}",
+            file=sys.stderr,
+        )
+    if issues:
+        return 2
+    # 注册系统工具
+    registry.register(LoadSkillTool(catalog, active_skills, registry))
+    registry.register(InstallSkillTool(catalog, Path(root)))
+    executor = Executor(catalog, active_skills, Path(root))
+
     # ── 会话上下文 + 运行时容器 ──
     session_ctx = new_session_context(root)
-    runtime = SessionRuntime(session=session_ctx)
+    runtime = SessionRuntime(session=session_ctx, active_skills=active_skills)
     sessions_dir = str(Path(root) / ".nuocode" / "sessions")
 
     # 会话 JSONL 写入器（chap09）
@@ -88,6 +109,8 @@ async def _amain() -> int:
             instruction_text=instruction_text,
             memory_text=memory_text,
             sessions_dir=sessions_dir,
+            catalog=catalog,
+            executor=executor,
         )
         try:
             await app.run_async()

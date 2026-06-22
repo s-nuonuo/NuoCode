@@ -11,6 +11,7 @@ from nuocode.tool import Result, _truncate
 
 class ReadFileTool:
     read_only = True
+    is_system = False
 
     def name(self) -> str:
         return "read_file"

@@ -131,6 +131,8 @@ class NuoCodeApp(App):
         instruction_text: str = "",
         memory_text: str = "",
         sessions_dir: str = "",
+        catalog=None,
+        executor=None,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
@@ -175,6 +177,13 @@ class NuoCodeApp(App):
         # chap10：slash 命令体系
         self._cmd_registry: CmdRegistry = CmdRegistry()
         register_builtins(self._cmd_registry)
+        # chap11：Skill catalog 与 Executor
+        self.catalog = catalog
+        self.executor = executor
+        if catalog is not None:
+            from nuocode.command.skills_register import register_skills_as_commands
+
+            register_skills_as_commands(self._cmd_registry, catalog)
         self.completion: CompletionMenu = CompletionMenu()
         self._cwd: str = os.getcwd()
 
@@ -228,6 +237,8 @@ class NuoCodeApp(App):
             instruction_text=self.instruction_text,
             memory_text=self.memory_text,
         )
+        if self.catalog is not None:
+            self.agent.with_catalog(self.catalog)
         # 将 model 名推送给 writer，以便首条消息带 model 字段
         if self.writer is not None:
             self.writer.set_model(cfg.model)
@@ -699,6 +710,31 @@ class NuoCodeApp(App):
     # 状态机查询
     def idle(self) -> bool:
         return self.state is SessionState.IDLE
+
+    # chap11: skills UI 接口
+    def list_catalog_skills(self) -> list[tuple[str, str, str]]:
+        if self.catalog is None:
+            return []
+        out: list[tuple[str, str, str]] = []
+        for sk in self.catalog.list():
+            out.append((sk.meta.name, sk.source.value, sk.meta.description))
+        return out
+
+    def list_active_skills(self) -> list[str]:
+        return list(self.runtime.active_skills.names())
+
+    def clear_active_skills(self) -> None:
+        self.runtime.active_skills.clear()
+
+    def append_assistant_message(self, text: str) -> None:
+        self.conv.add_assistant(text)
+
+    def recent_messages(self, n: int) -> list:
+        msgs = self.conv.messages()
+        return msgs[-n:] if n > 0 else list(msgs)
+
+    def all_messages(self) -> list:
+        return list(self.conv.messages())
 
     # ───────── chap10: 自动补全键位 ─────────
 

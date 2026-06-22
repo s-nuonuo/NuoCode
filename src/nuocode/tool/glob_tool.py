@@ -14,6 +14,7 @@ _MAX_RESULTS = 100
 
 class GlobTool:
     read_only = True
+    is_system = False
 
     def name(self) -> str:
         return "glob"
