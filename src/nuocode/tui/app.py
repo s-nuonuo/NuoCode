@@ -212,11 +212,29 @@ class NuoCodeApp(App):
             self._enter_idle()
         else:
             self._enter_selecting()
+        # chap12: emit SessionStart
+        asyncio.create_task(self._emit_session_start())
 
     # ───────── state transitions ─────────
 
     def _enter_selecting(self) -> None:
         self.state = SessionState.SELECTING
+
+    async def _emit_session_start(self) -> None:
+        """chap12: 向 hook 引擎发送 SessionStart 事件。"""
+        he = self.runtime.hook_engine if self.runtime is not None else None
+        if he is None:
+            return
+        from nuocode.hook.event import Event as HookEvent
+        payload = {
+            "event": "SessionStart",
+            "session_id": self.session_id,
+            "cwd": str(getattr(getattr(self, "runtime", None), "session", None) and
+                       self.runtime.session.sessions_dir or ""),
+        }
+        result = await he.dispatch(HookEvent.SESSION_START, payload)
+        if result.injected_prompts and self.runtime is not None:
+            self.runtime.append_reminders(result.injected_prompts)
         self.query_one("#select", OptionList).display = True
         self.query_one("#input", _ChatInput).display = False
         self.query_one("#streaming", Static).update("")
@@ -309,6 +327,31 @@ class NuoCodeApp(App):
 
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
+        # chap12: UserPromptSubmit hook emit（拦截检查后再 add_user + start_turn）
+        asyncio.create_task(self._submit_with_hook(text))
+
+    async def _submit_with_hook(self, text: str) -> None:
+        """chap12: 在 add_user+start_turn 前先 emit UserPromptSubmit；支持拦截。"""
+        log = self.query_one("#log", RichLog)
+        he = self.runtime.hook_engine if self.runtime is not None else None
+        if he is not None:
+            from nuocode.hook.event import Event as HookEvent
+            try:
+                payload = {
+                    "event": "UserPromptSubmit",
+                    "prompt": text,
+                    "session_id": self.session_id,
+                    "cwd": str(getattr(getattr(self, "runtime", None), "session", None) and
+                               self.runtime.session.sessions_dir or ""),
+                }
+                result = await he.dispatch(HookEvent.USER_PROMPT_SUBMIT, payload)
+                if result.injected_prompts:
+                    self.runtime.append_reminders(result.injected_prompts)
+                if result.blocked:
+                    log.write(f"● [hook 拦截] {result.blocking_hook_name}: {result.reason}")
+                    return  # 不 start_turn
+            except Exception as e:  # noqa: BLE001
+                pass  # hook 失败不影响主流程
         self.conv.add_user(text)
         self._start_turn()
 
@@ -673,6 +716,15 @@ class NuoCodeApp(App):
         from nuocode.compact import new_session_context
         from nuocode.session import Writer as SessWriter
 
+        # chap12: emit SessionEnd 前（同步调）
+        he = self.runtime.hook_engine if self.runtime is not None else None
+        if he is not None:
+            from nuocode.hook.event import Event as HookEvent
+            asyncio.create_task(he.dispatch(HookEvent.SESSION_END, {
+                "event": "SessionEnd",
+                "session_id": self.session_id,
+            }))
+
         # 关旧 writer
         try:
             if self.writer is not None:
@@ -695,8 +747,8 @@ class NuoCodeApp(App):
         self.conv = Conversation(
             on_append=new_writer.on_append, on_replace=new_writer.on_replace
         )
-        # 重置 runtime
-        self.runtime.reset_for_new_session(new_ctx)
+        # 重置 runtime（含 hook only_once 集合）
+        asyncio.create_task(self.runtime.reset_for_new_session(new_ctx))
         self.iter = 0
         self.usage_in = 0
         self.usage_out = 0
@@ -706,6 +758,9 @@ class NuoCodeApp(App):
             self._refresh_statusbar()
         except Exception:  # noqa: BLE001
             pass
+
+        # chap12: emit SessionStart 新会话
+        asyncio.create_task(self._emit_session_start())
 
     # 状态机查询
     def idle(self) -> bool:
@@ -735,6 +790,22 @@ class NuoCodeApp(App):
 
     def all_messages(self) -> list:
         return list(self.conv.messages())
+
+    # chap12: hooks UI 接口
+    def list_hooks(self) -> list[tuple[str, str, str, str]] | None:
+        """返回 [(name, event, action_type, source), ...] 或 None（引擎未初始化）。"""
+        he = self.runtime.hook_engine if self.runtime is not None else None
+        if he is None:
+            return None
+        return [
+            (
+                r.name,
+                r.event.value,
+                r.action.type.value,
+                r.source or "",
+            )
+            for r in he.rules
+        ]
 
     # ───────── chap10: 自动补全键位 ─────────
 

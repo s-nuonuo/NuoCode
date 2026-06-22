@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from nuocode.compact import (
     AutoCompactTrackingState,
@@ -22,6 +23,9 @@ from nuocode.compact import (
     SessionContext,
 )
 from nuocode.skills import ActiveSkills
+
+if TYPE_CHECKING:
+    from nuocode.hook.engine import Engine
 
 
 @dataclass
@@ -44,10 +48,19 @@ class SessionRuntime:
     # ── chap11: 跨轮已激活 Skill ──
     active_skills: ActiveSkills = field(default_factory=ActiveSkills)
 
-    def reset_for_new_session(self, ses_ctx: SessionContext) -> None:
-        """``/clear`` 入口：原子重置 compact 子状态、回合计数、估算锚点，并替换 session。
+    # ── chap12: Hook 引擎（可选）与 reminder 队列 ──
+    hook_engine: "Engine | None" = field(default=None)
+    """当前会话的 Hook 引擎，由 cli.py 注入。"""
 
-        ``run_lock`` 与 ``context_window``（若未来引入）不重置。
+    pending_reminders: list[str] = field(default_factory=list)
+    """下一轮 LLM 请求前要追加到 reminder 串的文本列表（Hook prompt 动作 / SessionStart 注入）。"""
+
+    _reminders_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def reset_for_new_session(self, ses_ctx: SessionContext) -> None:
+        """/clear 入口：原子重置 compact 子状态、回合计数、估算锚点，并替换 session。
+
+        ``run_lock`` 不重置。Hook only_once 集合也在此处清空（通过 hook_engine）。
         """
         self.session = ses_ctx
         self.replacement = ContentReplacementState()
@@ -56,6 +69,20 @@ class SessionRuntime:
         self.usage_anchor = 0
         self.anchor_msg_len = 0
         self.active_skills.clear()
+        async with self._reminders_lock:
+            self.pending_reminders.clear()
+        if self.hook_engine is not None:
+            await self.hook_engine.reset_for_new_session()
+
+    def append_reminders(self, prompts: list[str]) -> None:
+        """追加 Hook prompt 注入文本（调用方持有 event loop，同步追加即可）。"""
+        self.pending_reminders.extend(prompts)
+
+    def take_reminders(self) -> list[str]:
+        """取出并清空 pending_reminders，返回副本。"""
+        items = list(self.pending_reminders)
+        self.pending_reminders.clear()
+        return items
 
 
 __all__ = ["SessionRuntime"]

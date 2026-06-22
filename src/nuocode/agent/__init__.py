@@ -41,6 +41,14 @@ from nuocode.tool import DEFAULT_TIMEOUT, Registry
 
 logger = logging.getLogger(__name__)
 
+# ───────── Hook（可选）──────────
+try:
+    from nuocode.hook.engine import DispatchResult as _HookResult
+    from nuocode.hook.event import Event as _HookEvent
+    _HOOK_AVAILABLE = True
+except ImportError:
+    _HOOK_AVAILABLE = False
+
 # ───────── 常量 ─────────
 
 MAX_ITERATIONS: int = 25
@@ -146,6 +154,7 @@ class Agent:
         memory_manager=None,
         instruction_text: str = "",
         memory_text: str = "",
+        hook_engine=None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -167,6 +176,8 @@ class Agent:
         # chap11：Skill catalog（可选）与全量工具注册表（fork 场景使用）
         self._catalog = None
         self._full_registry: Registry | None = None
+        # chap12：Hook 引擎（可选）
+        self._hook_engine = hook_engine
 
     def with_catalog(self, catalog) -> Agent:  # noqa: ANN001
         """chap11：注入 Skill catalog。返回 self 以便链式调用。"""
@@ -177,6 +188,52 @@ class Agent:
         """chap11：fork 子 Agent 场景使用：保留完整 registry 引用以便后续反向查找。"""
         self._full_registry = full
         return self
+
+    # ── chap12: Hook 辅助 ──
+
+    async def _dispatch_hook(self, event, payload: dict) -> object:
+        """分派 Hook 事件。返回 DispatchResult（或空结果）；同时把注入的 prompts 写到 runtime。"""
+        if self._hook_engine is None:
+            # 返回一个简单的空结果对象
+            class _Empty:
+                blocked = False
+                reason = ""
+                blocking_hook_name = ""
+                injected_prompts: list = []
+
+            return _Empty()
+        result = await self._hook_engine.dispatch(event, payload)
+        if result.injected_prompts:
+            self._runtime.append_reminders(result.injected_prompts)
+        return result
+
+    def _build_reminder(self, mode: Mode, it: int) -> str:
+        """构建本轮 reminder 串：plan reminder + hook 注入文本。"""
+        from nuocode.prompt import plan_reminder
+
+        reminder = ""
+        if mode == Mode.PLAN:
+            full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
+            reminder = plan_reminder(full)
+        pending = self._runtime.take_reminders()
+        if pending:
+            extra = "\n\n".join(pending)
+            reminder = (reminder + "\n\n" + extra).strip() if reminder else extra
+        return reminder
+
+    def _base_payload(self) -> dict:
+        """构建 Hook 通用 payload（不含 event 字段，由各 emit 点补充）。"""
+        mode_name = getattr(self, "_current_mode", None)
+        mode_str = mode_name.name.lower() if mode_name is not None else "default"
+        try:
+            cwd_str = str(self._runtime.session.session_dir)
+        except AttributeError:
+            cwd_str = ""
+        return {
+            "session_id": self._runtime.session.session_id,
+            "cwd": cwd_str,
+            "mode": mode_str,
+        }
 
     def activate_skill(self, name: str, body: str) -> None:
         self._runtime.active_skills.activate(name, body)
@@ -232,6 +289,9 @@ class Agent:
         else:
             defs = self._registry.definitions()
 
+        # 记录当前 mode 供 _base_payload 使用
+        self._current_mode = mode
+
         # 重置该 conv 的 unknown_run 计数（重新进入 run 视为新一段会话）
         self._unknown_run_state[id(conv)] = 0
 
@@ -249,10 +309,7 @@ class Agent:
             except Exception as e:  # noqa: BLE001
                 logger.warning("auto manage_context failed: %s", e)
 
-            reminder = ""
-            if mode == Mode.PLAN:
-                full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
-                reminder = prompt.plan_reminder(full)
+            reminder = self._build_reminder(mode, it)
 
             # 单轮 ReAct：若发出 done / 终止 notice，整个 run 结束
             terminated = False
@@ -301,6 +358,17 @@ class Agent:
         iter_no: int,
     ) -> AsyncIterator[Event]:
         """驱动单轮 ReAct：stream → 工具执行 → 必要时 PTL 紧急重试。"""
+
+        # chap12: emit PRE_USER_MESSAGE 事件
+        if _HOOK_AVAILABLE:
+            msgs = conv.messages()
+            last_user_prompt = ""
+            for m in reversed(msgs):
+                if m.role == llm.ROLE_USER:
+                    last_user_prompt = m.content if isinstance(m.content, str) else ""
+                    break
+            payload = {**self._base_payload(), "event": "PreUserMessage", "prompt": last_user_prompt}
+            await self._dispatch_hook(_HookEvent.PRE_USER_MESSAGE, payload)
 
         # 第一次尝试
         text, calls, usage, err = "", [], None, None
@@ -371,6 +439,10 @@ class Agent:
         if not calls:
             conv.add_assistant(_ensure_final(text))
             self._maybe_trigger_memory_update(conv)
+            # chap12: emit STOP before done
+            if _HOOK_AVAILABLE:
+                payload = {**self._base_payload(), "event": "Stop", "iter": iter_no}
+                await self._dispatch_hook(_HookEvent.STOP, payload)
             yield Event(done=True)
             return
 
@@ -476,6 +548,12 @@ class Agent:
         """共享 compact 入口：把估算 → manage_context → CompactEvent 串起来。"""
         msgs = conv.messages()
         est = estimate_tokens(self._runtime.usage_anchor, msgs, self._runtime.anchor_msg_len)
+
+        # chap12: emit PRE_COMPACT
+        if _HOOK_AVAILABLE:
+            payload = {**self._base_payload(), "event": "PreCompact", "trigger": trigger.value}
+            await self._dispatch_hook(_HookEvent.PRE_COMPACT, payload)
+
         in_ = ManageInput(
             conv=conv,
             provider=self._provider,
@@ -522,6 +600,17 @@ class Agent:
             )
             self._runtime.usage_anchor = 0
             self._runtime.anchor_msg_len = conv.length()
+
+        # chap12: emit POST_COMPACT（无论 layer2 是否发生都通知，方便 hook 感知）
+        if _HOOK_AVAILABLE:
+            payload = {
+                **self._base_payload(),
+                "event": "PostCompact",
+                "trigger": trigger.value,
+                "before_tokens": out.before_tokens,
+                "after_tokens": out.after_tokens,
+            }
+            await self._dispatch_hook(_HookEvent.POST_COMPACT, payload)
 
     async def run_force_compact(self, conv: Conversation) -> AsyncIterator[Event]:
         """TUI ``/compact`` 入口：手动路径，与 ``run`` 互斥。"""
@@ -634,6 +723,45 @@ class Agent:
                 i = j
             else:
                 preview = _preview_args(calls[i].input)
+
+                # chap12: emit PreToolUse before permission check
+                if _HOOK_AVAILABLE:
+                    tool_input_parsed: dict = {}
+                    try:
+                        tool_input_parsed = json.loads(calls[i].input or "{}")
+                        if not isinstance(tool_input_parsed, dict):
+                            tool_input_parsed = {}
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    hook_payload = {
+                        **self._base_payload(),
+                        "event": "PreToolUse",
+                        "tool_name": calls[i].name,
+                        "tool_input": tool_input_parsed,
+                    }
+                    hook_result = await self._dispatch_hook(_HookEvent.PRE_TOOL_USE, hook_payload)
+                    if getattr(hook_result, "blocked", False):
+                        # Hook 拦截：当 tool_result 回灌，不走权限引擎
+                        yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
+                        hook_name = getattr(hook_result, "blocking_hook_name", "hook")
+                        hook_reason = getattr(hook_result, "reason", "")
+                        results[i] = ToolResult(
+                            tool_call_id=calls[i].id,
+                            content=f"[hook {hook_name}] {hook_reason}",
+                            is_error=True,
+                        )
+                        yield Event(
+                            tool=ToolEvent(
+                                name=calls[i].name,
+                                args=preview,
+                                phase=Phase.END,
+                                result=results[i].content,
+                                is_error=True,
+                            )
+                        )
+                        i += 1
+                        continue
+
                 yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
 
                 decision, reason = self._engine.check(mode, calls[i], False)
@@ -656,6 +784,15 @@ class Agent:
                         reason=reason,
                         respond=respond,
                     )
+                    # chap12: emit NOTIFICATION before approval
+                    if _HOOK_AVAILABLE:
+                        notif_payload = {
+                            **self._base_payload(),
+                            "event": "Notification",
+                            "kind": "approval",
+                            "detail": calls[i].name,
+                        }
+                        await self._dispatch_hook(_HookEvent.NOTIFICATION, notif_payload)
                     yield Event(approval=req)
                     try:
                         outcome = await respond
@@ -682,6 +819,19 @@ class Agent:
 
                 r = results[i]
                 assert r is not None
+
+                # chap12: emit PostToolUse after result
+                if _HOOK_AVAILABLE:
+                    post_payload = {
+                        **self._base_payload(),
+                        "event": "PostToolUse",
+                        "tool_name": calls[i].name,
+                        "tool_input": tool_input_parsed,
+                        "tool_result": (r.content or "")[:200],
+                        "is_error": r.is_error,
+                    }
+                    await self._dispatch_hook(_HookEvent.POST_TOOL_USE, post_payload)
+
                 yield Event(
                     tool=ToolEvent(
                         name=calls[i].name,

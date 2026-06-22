@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nuocode.command.builtin_local import (
+    handle_hooks,
     handle_memory,
     handle_permission,
     handle_session,
@@ -30,6 +31,7 @@ def register_builtins(reg: Registry) -> None:
         Command(name="do", description="切回默认模式并执行已确认的计划", kind=Kind.PROMPT, handler=handle_do),
         Command(name="exit", description="退出 nuocode", kind=Kind.UI, handler=handle_exit),
         Command(name="help", description="显示所有可用命令", kind=Kind.LOCAL, handler=make_help_handler(reg)),
+        Command(name="hooks", description="列出已加载的 Hook 规则", kind=Kind.LOCAL, handler=handle_hooks),
         Command(name="memory", description="列出已加载的项目/用户记忆文件", kind=Kind.LOCAL, handler=handle_memory),
         Command(name="permission", description="显示当前权限模式", kind=Kind.LOCAL, handler=handle_permission),
         Command(name="plan", description="切换到计划模式（仅只读工具）", kind=Kind.UI, handler=handle_plan),

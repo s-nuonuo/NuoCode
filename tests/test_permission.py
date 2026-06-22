@@ -128,12 +128,12 @@ def test_sandbox_symlink_escape(tmp_path: Path) -> None:
 
 
 def test_parse_rule() -> None:
-    r, ok = parse_rule("Bash(git *)")
-    assert ok and r.tool == "Bash" and r.pattern == "git *"
-    r, ok = parse_rule("Read")
-    assert ok and r.tool == "Read" and r.pattern == ""
-    r, ok = parse_rule("Bash(  ")
-    assert not ok
+    r, err = parse_rule("Bash(git *)")
+    assert r is not None and err is None and r.tool == "Bash" and r.raw == "git *"
+    r, err = parse_rule("Read")
+    assert r is not None and err is None and r.tool == "Read" and r.matcher is None
+    r, err = parse_rule("Bash(  ")
+    assert r is None and err is not None
 
 
 def test_match_pattern_command() -> None:
@@ -153,11 +153,12 @@ def test_match_pattern_path() -> None:
 
 
 def test_ruleset_deny_priority() -> None:
+    from nuocode.permission.matcher import GlobMatcher
     from nuocode.permission.rule import Rule
 
     rs = RuleSet(
-        allow=[Rule("Bash", "git *", True)],
-        deny=[Rule("Bash", "git push", False)],
+        allow=[Rule("Bash", GlobMatcher("git *", is_command=True), True, "git *")],
+        deny=[Rule("Bash", GlobMatcher("git push", is_command=True), False, "git push")],
     )
     d, hit = rs.match("Bash", "git push")
     assert hit and d == Decision.DENY

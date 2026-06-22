@@ -1,23 +1,40 @@
-"""权限规则与匹配（F3）。
+"""权限规则与匹配（chap12 升级版）。
 
-规则形如 `Tool(pattern)` 或 `Tool`：
+规则形如 ``Tool(pattern)`` 或 ``Tool``：
 - 工具名为友好名（Bash/Read/Write/Edit/Glob/Grep）。
-- pattern 段支持 glob：`*` 任意串；`**` 文件路径跨目录段（命令串等价 `*`）。
+- pattern 段支持四种匹配语法（见 matcher.py）：
+  - ``=value``  精确匹配
+  - ``~regex``  正则匹配
+  - ``!inner``  对 inner 取反
+  - ``value``   无前缀 → glob（向后兼容）
+
+向后兼容：现有 ``Bash(git *)`` 写法继续工作，解析为 GlobMatcher。
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from nuocode.permission import Decision
+from nuocode.permission.matcher import Matcher, GlobMatcher, compile_matcher
+
+if TYPE_CHECKING:
+    pass
 
 
 @dataclass
 class Rule:
-    tool: str  # 友好名
-    pattern: str  # "" = 该工具全部调用
-    allow: bool  # True=allow, False=deny
+    tool: str                    # 友好名
+    matcher: Matcher | None      # None = 该工具全匹配；替换原 pattern 字符串
+    allow: bool                  # True=allow, False=deny
+    raw: str = ""                # 原始 pattern 串，供日志 / 调试使用
+    # 向后兼容：暴露 .pattern 属性
+    @property
+    def pattern(self) -> str:
+        """向后兼容属性：返回 raw（原始 pattern 串）。"""
+        return self.raw
 
 
 @dataclass
@@ -28,45 +45,62 @@ class RuleSet:
     def match(self, friendly: str, target: str) -> tuple[Decision, bool]:
         """先 deny 后 allow；返回 (裁决, 命中?)；未命中则 (ALLOW, False)。"""
         for r in self.deny:
-            if r.tool == friendly and match_pattern(r.pattern, target):
+            if r.tool == friendly and match_rule(r, target):
                 return (Decision.DENY, True)
         for r in self.allow:
-            if r.tool == friendly and match_pattern(r.pattern, target):
+            if r.tool == friendly and match_rule(r, target):
                 return (Decision.ALLOW, True)
         return (Decision.ALLOW, False)
 
 
-def parse_rule(s: str) -> tuple[Rule, bool]:
-    """解析 `Tool(pattern)` 或 `Tool`；非法返回 (Rule("","",False), False)。"""
+def match_rule(r: Rule, target: str) -> bool:
+    """用 Rule 中的 matcher 匹配 target。None matcher 表示全匹配。"""
+    if r.matcher is None:
+        return True
+    return r.matcher.match(target)
+
+
+def parse_rule(s: str) -> tuple[Rule | None, str | None]:
+    """解析 ``Tool(pattern)`` 或 ``Tool``。
+
+    返回 ``(Rule, None)`` 或 ``(None, error_message)``。
+    失败时不抛异常，由调用方决定如何处理错误（通常打 stderr 后跳过）。
+    """
     if not s or not isinstance(s, str):
-        return (Rule("", "", False), False)
+        return (None, "empty or non-string rule")
     s = s.strip()
     if not s:
-        return (Rule("", "", False), False)
+        return (None, "empty rule string")
     if "(" not in s:
-        # `Tool` —— 全匹配
-        if not s.isidentifier() and not s.isalpha():
-            # 限制为字母名（友好名都是字母）
-            pass
-        return (Rule(tool=s, pattern="", allow=False), True)
+        # ``Tool`` —— 全匹配
+        return (Rule(tool=s, matcher=None, allow=False, raw=""), None)
     if not s.endswith(")"):
-        return (Rule("", "", False), False)
+        return (None, f"missing closing ')' in rule {s!r}")
     lparen = s.index("(")
     tool = s[:lparen].strip()
     pattern = s[lparen + 1 : -1]
     if not tool:
-        return (Rule("", "", False), False)
-    return (Rule(tool=tool, pattern=pattern, allow=False), True)
+        return (None, f"empty tool name in rule {s!r}")
+    if pattern == "":
+        # 空 pattern → 全匹配
+        return (Rule(tool=tool, matcher=None, allow=False, raw=""), None)
+    # 编译 matcher：Bash 工具使用 is_command=True（整串通配）
+    try:
+        m = compile_matcher(pattern, is_command=(tool == "Bash"))
+    except ValueError as e:
+        return (None, str(e))
+    return (Rule(tool=tool, matcher=m, allow=False, raw=pattern), None)
 
+
+# ────────── 向后兼容：保留 match_pattern（供现有测试直接调用）──────────
 
 def _glob_to_regex_command(pattern: str) -> str:
-    """命令 glob：`*` 与 `**` 都匹配任意字符（含空格、含 `/`）。"""
+    """命令 glob：``*`` 与 ``**`` 都匹配任意字符（含空格、含 ``/``）。"""
     out: list[str] = []
     i = 0
     while i < len(pattern):
         c = pattern[i]
         if c == "*":
-            # 吞掉连续的 *
             while i < len(pattern) and pattern[i] == "*":
                 i += 1
             out.append(".*")
@@ -80,15 +114,13 @@ def _glob_to_regex_command(pattern: str) -> str:
 
 
 def _glob_to_regex_path(pattern: str) -> str:
-    """文件路径 glob：`*` 段内任意（不含 `/`）；`**` 跨目录段（含 `/`）。"""
+    """文件路径 glob：``*`` 段内任意（不含 ``/``）；``**`` 跨目录段（含 ``/``）。"""
     out: list[str] = []
     i = 0
     while i < len(pattern):
         c = pattern[i]
         if c == "*":
             if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                # **
-                # 吞 ** 及其后可能的 /
                 i += 2
                 if i < len(pattern) and pattern[i] == "/":
                     out.append("(?:.*/)?")
@@ -109,7 +141,7 @@ def _glob_to_regex_path(pattern: str) -> str:
 
 
 def match_pattern(pattern: str, target: str) -> bool:
-    """空 pattern 恒匹配。`target` 含 `/` 视为路径，否则视为命令串。"""
+    """向后兼容函数：空 pattern 恒匹配。``target`` 含 ``/`` 视为路径，否则命令串。"""
     if pattern == "":
         return True
     target = target or ""
@@ -123,4 +155,4 @@ def match_pattern(pattern: str, target: str) -> bool:
         return False
 
 
-__all__ = ["Rule", "RuleSet", "match_pattern", "parse_rule"]
+__all__ = ["Rule", "RuleSet", "match_pattern", "match_rule", "parse_rule"]

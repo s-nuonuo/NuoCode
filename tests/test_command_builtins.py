@@ -1,4 +1,4 @@
-"""builtins 单测：12 条注册 + 关键 handler 行为。"""
+"""builtins 单测：13 条注册 + 关键 handler 行为。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ EXPECTED_NAMES = [
     "do",
     "exit",
     "help",
+    "hooks",
     "memory",
     "permission",
     "plan",
@@ -30,7 +31,7 @@ def test_register_builtins_all_registered() -> None:
     reg = Registry()
     register_builtins(reg)
     cmds = reg.visible()
-    assert len(cmds) == 12
+    assert len(cmds) == 13
     assert [c.name for c in cmds] == EXPECTED_NAMES
     for n in EXPECTED_NAMES:
         assert reg.lookup(n) is not None

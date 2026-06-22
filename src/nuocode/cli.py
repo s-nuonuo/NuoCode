@@ -77,7 +77,16 @@ async def _amain() -> int:
 
     # ── 会话上下文 + 运行时容器 ──
     session_ctx = new_session_context(root)
-    runtime = SessionRuntime(session=session_ctx, active_skills=active_skills)
+
+    # ── chap12: Hook 引擎 ──
+    hook_engine = None
+    try:
+        from nuocode.hook import load as hook_load
+        hook_engine = hook_load(root)
+    except Exception as e:  # noqa: BLE001
+        print(f"[hooks] 加载失败，Hook 系统已禁用: {e}", file=sys.stderr)
+
+    runtime = SessionRuntime(session=session_ctx, active_skills=active_skills, hook_engine=hook_engine)
     sessions_dir = str(Path(root) / ".nuocode" / "sessions")
 
     # 会话 JSONL 写入器（chap09）

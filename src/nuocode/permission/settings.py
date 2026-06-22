@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,15 +61,22 @@ def load_settings(path: str) -> Settings:
 
 
 def to_rule_set(s: Settings) -> RuleSet:
+    """把 Settings 转换为 RuleSet。parse_rule 失败时打 stderr 并跳过该条规则。"""
     rs = RuleSet()
     for line in s.permissions.allow:
-        r, ok = parse_rule(line)
-        if ok:
-            rs.allow.append(Rule(tool=r.tool, pattern=r.pattern, allow=True))
+        r, err = parse_rule(line)
+        if r is None:
+            if line.strip():  # 非空行才报
+                print(f'rule {line!r} parse failed: {err}', file=sys.stderr)
+            continue
+        rs.allow.append(Rule(tool=r.tool, matcher=r.matcher, allow=True, raw=r.raw))
     for line in s.permissions.deny:
-        r, ok = parse_rule(line)
-        if ok:
-            rs.deny.append(Rule(tool=r.tool, pattern=r.pattern, allow=False))
+        r, err = parse_rule(line)
+        if r is None:
+            if line.strip():
+                print(f'rule {line!r} parse failed: {err}', file=sys.stderr)
+            continue
+        rs.deny.append(Rule(tool=r.tool, matcher=r.matcher, allow=False, raw=r.raw))
     return rs
 
 

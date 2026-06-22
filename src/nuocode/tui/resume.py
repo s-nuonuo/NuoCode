@@ -134,6 +134,20 @@ async def do_resume_session(app: NuoCodeApp, info: SessionInfo) -> None:
 
     log.write(f"● 已恢复会话 {info.id}，共 {len(msgs)} 条消息")
 
+    # chap12: emit SessionResume
+    he = getattr(app.runtime, "hook_engine", None)
+    if he is not None:
+        from nuocode.hook.event import Event as HookEvent
+        try:
+            result = await he.dispatch(HookEvent.SESSION_RESUME, {
+                "event": "SessionResume",
+                "session_id": info.id,
+            })
+            if result.injected_prompts:
+                app.runtime.append_reminders(result.injected_prompts)
+        except Exception:  # noqa: BLE001
+            pass
+
 
 def handle_resume_selection(app: NuoCodeApp, opt_id: str) -> None:
     """OptionList Enter 选择回调（id 形如 ``resume:N``）。"""

@@ -24,11 +24,11 @@ def test_menu_inactive_when_not_slash() -> None:
     assert not m.active
 
 
-def test_menu_activates_on_slash_with_all_12() -> None:
+def test_menu_activates_on_slash_with_all_13() -> None:
     m = CompletionMenu()
     m.update("/", _full_reg())
     assert m.active
-    assert len(m.items) == 12
+    assert len(m.items) == 13
 
 
 def test_menu_filters_by_prefix_s() -> None:

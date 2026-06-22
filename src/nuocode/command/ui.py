@@ -52,6 +52,9 @@ class UI(Protocol):
     def recent_messages(self, n: int) -> list: ...
     def all_messages(self) -> list: ...
 
+    # chap12: hooks
+    def list_hooks(self) -> list[tuple[str, str, str, str]] | None: ...
+
 
 class NopUI:
     """测试桩：所有写入方法 no-op；查询返回零值。"""
@@ -126,6 +129,10 @@ class NopUI:
 
     def all_messages(self) -> list:
         return []
+
+    # chap12 hooks no-op
+    def list_hooks(self) -> list[tuple[str, str, str, str]] | None:
+        return None
 
 
 __all__ = ["NopUI", "UI"]

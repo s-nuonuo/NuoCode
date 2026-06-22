@@ -85,7 +85,23 @@ async def handle_skill(ui: UI) -> None:
     ui.println("\n".join(lines))
 
 
+async def handle_hooks(ui: UI) -> None:
+    """chap12 ``/hooks``：列出已加载的 Hook 规则（来源 + 事件 + 动作类型 + 名称）。"""
+    hooks_info = ui.list_hooks()
+    if hooks_info is None:
+        ui.println("Hook 系统未初始化")
+        return
+    if not hooks_info:
+        ui.println("未加载任何 Hook 规则")
+        return
+    lines = [f"已加载 Hook 规则 ({len(hooks_info)}):"]
+    for name, event, action_type, source in hooks_info:
+        lines.append(f"  {name.ljust(20)} [{event.ljust(16)}] ({action_type}) — {source}")
+    ui.println("\n".join(lines))
+
+
 __all__ = [
+    "handle_hooks",
     "handle_memory",
     "handle_permission",
     "handle_session",
