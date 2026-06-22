@@ -17,12 +17,15 @@ from textual.widgets.option_list import Option
 from nuocode import __version__
 from nuocode.agent import Agent, ApprovalRequest, Phase
 from nuocode.agent.runtime import SessionRuntime
+from nuocode.command import Registry as CmdRegistry
+from nuocode.command import register_builtins
 from nuocode.config import ProviderConfig
 from nuocode.conversation import Conversation
 from nuocode.llm import Provider, new_provider
 from nuocode.permission import Engine, Mode, Outcome
 from nuocode.prompt import render_banner
 from nuocode.tool import Registry
+from nuocode.tui.complete import CompletionMenu
 from nuocode.tui.view import (
     approval_block,
     assistant_block,
@@ -70,16 +73,31 @@ class _ChatInput(TextArea):
     ]
 
     def action_submit(self) -> None:
+        app = self.app
+        # APPROVING 时把 Enter 转发给权限确认，避免被 priority binding 吞掉
+        if isinstance(app, NuoCodeApp):
+            if app.state is SessionState.APPROVING:
+                app._update_approving("enter")
+                return
+            if app.state is not SessionState.IDLE:
+                return
         text = self.text
         if not text.strip():
             return
-        app = self.app
         if isinstance(app, NuoCodeApp):
             self.clear()
             app.post_submit(text)
 
     def action_newline(self) -> None:
         self.insert("\n")
+
+    def on_key(self, event) -> None:  # noqa: ANN001
+        """APPROVING 态下，将按键转给 App 处理，避免 TextArea 自身消费数字/方向键。"""
+        app = self.app
+        if isinstance(app, NuoCodeApp) and app.state is SessionState.APPROVING:
+            if app._update_approving(event.key):
+                event.stop()
+                event.prevent_default()
 
 
 class NuoCodeApp(App):
@@ -90,6 +108,7 @@ class NuoCodeApp(App):
     #log { height: 1fr; border: none; padding: 0 1; }
     #streaming { height: auto; min-height: 0; padding: 0 1; color: $text; }
     #input { height: 5; border: round $accent; padding: 0 1; }
+    #completion { height: auto; min-height: 0; padding: 0 1; color: $text-muted; }
     #statusbar { height: 1; background: $boost; padding: 0 1; }
     #select { height: 1fr; border: round $accent; padding: 1 2; }
     .hidden { display: none; }
@@ -153,6 +172,11 @@ class NuoCodeApp(App):
         # chap06：人在回路
         self.pending: ApprovalRequest | None = None
         self.approve_cursor: int = 0
+        # chap10：slash 命令体系
+        self._cmd_registry: CmdRegistry = CmdRegistry()
+        register_builtins(self._cmd_registry)
+        self.completion: CompletionMenu = CompletionMenu()
+        self._cwd: str = os.getcwd()
 
     # ───────── compose ─────────
 
@@ -168,6 +192,7 @@ class NuoCodeApp(App):
         ta = _ChatInput(id="input")
         ta.show_line_numbers = False
         yield ta
+        yield Static("", id="completion")
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
@@ -267,16 +292,23 @@ class NuoCodeApp(App):
         if self.agent is None:
             return
 
-        from nuocode.tui import commands as cmd_mod
-
-        if cmd_mod.is_command(text):
-            cmd_mod.dispatch(self, text)
+        if text.strip().startswith("/"):
+            asyncio.create_task(self._dispatch_and_clear(text))
             return
 
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
         self.conv.add_user(text)
         self._start_turn()
+
+    async def _dispatch_and_clear(self, text: str) -> None:
+        from nuocode.tui.commands import dispatch_slash
+
+        try:
+            await dispatch_slash(self, text)
+        finally:
+            self.completion.hide()
+            self._refresh_completion_view()
 
     def start_force_compact(self) -> None:
         """``/compact`` 命令入口：以异步任务跑 ``Agent.run_force_compact``。"""
@@ -356,11 +388,20 @@ class NuoCodeApp(App):
                     self.pending = ev.approval
                     self.approve_cursor = 0
                     self.state = SessionState.APPROVING
+                    # 卸下输入框焦点，使 Enter/方向键/数字键能冒泡到 App.on_key
+                    try:
+                        self.set_focus(None)
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._refresh_approving_view()
                     await self._wait_for_approval()
                     # 收到决策后回到 STREAMING
                     self.state = SessionState.STREAMING
                     self.pending = None
+                    try:
+                        self.query_one("#input", _ChatInput).focus()
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._refresh_streaming_view()
                     continue
                 if ev.tool is not None:
@@ -483,6 +524,12 @@ class NuoCodeApp(App):
     # ───────── 待批准态按键 ─────────
 
     def on_key(self, event) -> None:
+        # chap10: 输入框 + 补全菜单激活时优先消费 ↑/↓/Enter/Tab/Esc
+        if self.state is SessionState.IDLE and self.completion.active:
+            if self._completion_handle_key(event.key):
+                event.stop()
+                event.prevent_default()
+                return
         if self.state is not SessionState.APPROVING:
             return
         if self.pending is None:
@@ -529,3 +576,194 @@ class NuoCodeApp(App):
             return
         if not self.pending.respond.done():
             self.pending.respond.set_result(outcome)
+
+    # ───────── chap10: command UI Protocol 实现 ─────────
+
+    @property
+    def cmd_registry(self) -> CmdRegistry:
+        return self._cmd_registry
+
+    def _cmd_log(self) -> RichLog:
+        return self.query_one("#log", RichLog)
+
+    # 输出
+    def println(self, msg: str) -> None:
+        self._cmd_log().write(notice_block(msg))
+
+    def error(self, msg: str) -> None:
+        self._cmd_log().write(error_block(RuntimeError(msg)))
+
+    # 模式（`mode` 属性已存在，set_mode 用于命令切换）
+    def set_mode(self, m: Mode) -> None:
+        self.mode = m
+        try:
+            self._refresh_statusbar()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 对话注入
+    def inject_and_send(self, display_label: str, preset_prompt: str) -> None:
+        log = self._cmd_log()
+        log.write(user_block(display_label))
+        self.conv.add_user(preset_prompt)
+        self._start_turn()
+
+    # 只读查询
+    def model_name(self) -> str:
+        if self.provider is None:
+            return ""
+        return getattr(self.provider, "model", "") or ""
+
+    def cwd(self) -> str:
+        return self._cwd
+
+    def tool_count(self) -> int:
+        return self.registry.count()
+
+    def memory_files(self) -> list[str]:
+        if self.mem_mgr is None:
+            return []
+        try:
+            project, user = self.mem_mgr.list_files()
+        except Exception:  # noqa: BLE001
+            return []
+        merged: list[str] = []
+        if project:
+            merged.extend(project)
+        if user:
+            # 区分前缀，避免同名混淆
+            merged.extend(f"~/{n}" for n in user)
+        return merged
+
+    def session_path(self) -> str:
+        if self.writer is None:
+            return ""
+        return getattr(self.writer, "path", "") or ""
+
+    def session_id(self) -> str:
+        try:
+            return self.runtime.session.session_id
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # 影响界面动作
+    def quit(self) -> None:
+        self.exit()
+
+    def force_compact(self) -> None:
+        self.start_force_compact()
+
+    def open_resume_menu(self) -> None:
+        from nuocode.tui import resume as resume_mod
+
+        resume_mod.begin_resume(self)
+
+    def clear_and_new_session(self) -> None:
+        from nuocode.compact import new_session_context
+        from nuocode.session import Writer as SessWriter
+
+        # 关旧 writer
+        try:
+            if self.writer is not None:
+                self.writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 新 session_ctx + writer
+        try:
+            new_ctx = new_session_context(self._cwd)
+            new_writer = SessWriter(new_ctx.session_dir)
+            if self.provider is not None:
+                new_writer.set_model(getattr(self.provider, "model", ""))
+        except Exception as e:  # noqa: BLE001
+            self.error(f"新建 session 失败: {e}")
+            return
+
+        self.writer = new_writer
+        # 重建 conversation 绑定新 writer
+        self.conv = Conversation(
+            on_append=new_writer.on_append, on_replace=new_writer.on_replace
+        )
+        # 重置 runtime
+        self.runtime.reset_for_new_session(new_ctx)
+        self.iter = 0
+        self.usage_in = 0
+        self.usage_out = 0
+        # 清空对话区域
+        try:
+            self._cmd_log().clear()
+            self._refresh_statusbar()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 状态机查询
+    def idle(self) -> bool:
+        return self.state is SessionState.IDLE
+
+    # ───────── chap10: 自动补全键位 ─────────
+
+    def _refresh_completion_view(self) -> None:
+        try:
+            comp = self.query_one("#completion", Static)
+        except Exception:  # noqa: BLE001
+            return
+        if self.completion.active:
+            try:
+                width = self.size.width
+            except Exception:  # noqa: BLE001
+                width = 80
+            comp.update(self.completion.render(width))
+        else:
+            comp.update("")
+
+    def _sync_completion_from_input(self) -> None:
+        try:
+            ti = self.query_one("#input", _ChatInput)
+        except Exception:  # noqa: BLE001
+            return
+        text = ti.text
+        self.completion.update(text, self._cmd_registry)
+        self._refresh_completion_view()
+
+    async def _execute_completion_selected(self) -> None:
+        sel = self.completion.selected()
+        if sel is None:
+            self.completion.hide()
+            self._refresh_completion_view()
+            return
+        try:
+            ti = self.query_one("#input", _ChatInput)
+            ti.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        self.completion.hide()
+        self._refresh_completion_view()
+        await self._dispatch_and_clear(f"/{sel.name}")
+
+    def on_text_area_changed(self, event) -> None:  # noqa: ANN001
+        try:
+            if event.text_area.id == "input":
+                self._sync_completion_from_input()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 旧 `on_key` 仅处理 APPROVING；这里追加补全键位与备份
+    def _completion_handle_key(self, key: str) -> bool:
+        if not self.completion.active:
+            return False
+        if key == "up":
+            self.completion.move_up()
+            self._refresh_completion_view()
+            return True
+        if key == "down":
+            self.completion.move_down()
+            self._refresh_completion_view()
+            return True
+        if key == "escape":
+            self.completion.hide()
+            self._refresh_completion_view()
+            return True
+        if key in ("enter", "tab"):
+            asyncio.create_task(self._execute_completion_selected())
+            return True
+        return False

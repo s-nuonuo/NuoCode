@@ -40,5 +40,17 @@ class SessionRuntime:
     # ── 互斥锁：run vs run_force_compact ──
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    def reset_for_new_session(self, ses_ctx: SessionContext) -> None:
+        """``/clear`` 入口：原子重置 compact 子状态、回合计数、估算锚点，并替换 session。
+
+        ``run_lock`` 与 ``context_window``（若未来引入）不重置。
+        """
+        self.session = ses_ctx
+        self.replacement = ContentReplacementState()
+        self.recovery = RecoveryState()
+        self.auto_tracking = AutoCompactTrackingState()
+        self.usage_anchor = 0
+        self.anchor_msg_len = 0
+
 
 __all__ = ["SessionRuntime"]

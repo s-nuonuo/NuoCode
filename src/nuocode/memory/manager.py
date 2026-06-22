@@ -48,6 +48,26 @@ class Manager:
         if model:
             self._model = model
 
+    def list_files(self) -> tuple[list[str], list[str]]:
+        """列出项目层与用户层 memory 目录下的 ``.md`` 文件名（含 MEMORY.md），按字典序。
+
+        目录不存在视为空 list；其他 ``OSError`` 记 warning 后视为空 list。
+        """
+        return self._scan(self._project_store.dir), self._scan(self._user_store.dir)
+
+    @staticmethod
+    def _scan(d: str) -> list[str]:
+        import os as _os
+
+        try:
+            entries = _os.listdir(d)
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            logger.warning("list memory dir failed: %s (%s)", d, e)
+            return []
+        return sorted(n for n in entries if n.endswith(".md"))
+
     def load_index(self) -> str:
         """合并两级索引：项目级在前、用户级在后；超 25KB 截断。"""
         project = self._project_store.load_index()

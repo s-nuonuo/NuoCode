@@ -43,7 +43,8 @@ CAT_BANNER: str = r"""
 """.lstrip("\n")
 
 READY_HINT: str = (
-    "Ready. Type your message and press Enter to send. (Alt+Enter for newline, /exit to quit)"
+    "Ready. Type your message and press Enter to send. "
+    "(Alt+Enter for newline, type / to see commands)"
 )
 
 

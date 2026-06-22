@@ -77,6 +77,10 @@ class Registry:
     def names(self) -> list[str]:
         return list(self._order)
 
+    def count(self) -> int:
+        """已注册工具数量（chap10 /status 用）。"""
+        return len(self._order)
+
     def definitions(self) -> list[ToolDefinition]:
         """按注册顺序导出 ToolDefinition 列表（F3/AC1）。"""
         return [
