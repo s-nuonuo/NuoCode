@@ -173,3 +173,33 @@ def test_name_regex_rejects_invalid():
     data = b"---\nname: 123bad\ndescription: x\n---\nbody"
     with pytest.raises(ValueError):
         parse_definition(data, "test.md", Source.BUILTIN)
+
+
+# ─── chap14: isolation 字段 ────────────────────────────────────────────────
+
+
+def test_isolation_worktree():
+    """isolation: worktree 解析为 'worktree'。"""
+    d = parse_definition(_md(extra="isolation: worktree"), "test.md", Source.PROJECT)
+    assert d.isolation == "worktree"
+
+
+def test_isolation_empty_default():
+    """不写 isolation 时，默认为空字符串。"""
+    d = parse_definition(_md(), "test.md", Source.BUILTIN)
+    assert d.isolation == ""
+
+
+def test_isolation_invalid_fallback(capsys):
+    """非法 isolation 值 → stderr 警告 + fallback 到 ''。"""
+    d = parse_definition(_md(extra="isolation: docker"), "test.md", Source.USER)
+    assert d.isolation == ""
+    captured = capsys.readouterr()
+    assert "unknown isolation" in captured.err
+
+
+def test_isolation_case_insensitive():
+    """isolation: WORKTREE 应被 lower 处理为 worktree。"""
+    d = parse_definition(_md(extra="isolation: WORKTREE"), "test.md", Source.USER)
+    assert d.isolation == "worktree"
+

@@ -137,6 +137,8 @@ class NuoCodeApp(App):
         subagent_catalog=None,
         task_manager=None,
         enable_subagent_background: bool = True,
+        # chap14：Worktree 扩展
+        worktree_mgr=None,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
@@ -199,6 +201,9 @@ class NuoCodeApp(App):
             self._task_done_queue = task_manager.subscribe_done()
         else:
             self._task_done_queue = None
+        # chap14：Worktree
+        self.worktree_mgr = worktree_mgr  # Manager | None
+        self.active_cwd: str = self._cwd  # 当前生效 cwd（进入 Worktree 后更新）
 
     # ───────── compose ─────────
 
@@ -308,6 +313,7 @@ class NuoCodeApp(App):
                 task_manager=self.task_manager,
                 enable_background=self.enable_subagent_background,
                 parent_conv=self.conv,
+                worktree_mgr=self.worktree_mgr,  # chap14
             )
             self.registry.register(agent_tool)
         # 将 model 名推送给 writer，以便首条消息带 model 字段
@@ -484,6 +490,13 @@ class NuoCodeApp(App):
     async def _consume_agent_events(self) -> None:
         assert self.agent is not None
         log = self.query_one("#log", RichLog)
+        # chap14: 用 with_cwd 把当前 active_cwd 注入 ctx，使 resolve_path 生效
+        from nuocode.tool.ctx import with_cwd as _with_cwd
+        with _with_cwd(self.active_cwd):
+            await self._run_agent_events(log)
+
+    async def _run_agent_events(self, log) -> None:  # noqa: ANN001
+        assert self.agent is not None
         try:
             assert self.turn_cancel is not None
             async for ev in self.agent.run(self.conv, self.mode, self.turn_cancel):
@@ -859,6 +872,14 @@ class NuoCodeApp(App):
             )
             for r in he.rules
         ]
+
+    # chap14: worktree UI 接口
+    def worktree_accessor(self):  # -> WorktreeAccessor | None
+        """返回 _WorktreeAccessorImpl（如 worktree_mgr 存在）。"""
+        if self.worktree_mgr is None:
+            return None
+        from nuocode.tui.worktree_adapter import WorktreeAccessorImpl
+        return WorktreeAccessorImpl(self.worktree_mgr, self)
 
     # ───────── chap10: 自动补全键位 ─────────
 

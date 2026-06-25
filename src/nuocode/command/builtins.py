@@ -1,4 +1,4 @@
-"""一次性把内置命令注册进 Registry（chap11：移除 /review，新增 /skill）。"""
+"""一次性把内置命令注册进 Registry（chap11：移除 /review，新增 /skill；chap14：新增 /worktree）。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from nuocode.command.builtin_ui import (
     handle_plan,
     handle_resume,
 )
+from nuocode.command.builtin_worktree import handle_worktree
 from nuocode.command.command import Command, Kind
 from nuocode.command.registry import Registry
 
@@ -39,6 +40,7 @@ def register_builtins(reg: Registry) -> None:
         Command(name="session", description="显示当前会话标识与存档路径", kind=Kind.LOCAL, handler=handle_session),
         Command(name="skill", description="显示 Skill catalog 与已激活列表", kind=Kind.LOCAL, handler=handle_skill),
         Command(name="status", description="显示模式/用量/工具/记忆/模型/目录概览", kind=Kind.LOCAL, handler=handle_status),
+        Command(name="worktree", description="管理 Git Worktree（create/list/enter/exit/remove）", kind=Kind.LOCAL, handler=handle_worktree),
     ]
     for cmd in items:
         reg.register(cmd)

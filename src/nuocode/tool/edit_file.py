@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nuocode.tool import Result
+from nuocode.tool.ctx import resolve_path
 
 
 class EditFileTool:
@@ -53,7 +54,8 @@ class EditFileTool:
         if not isinstance(new_string, str):
             return Result(content="参数 new_string 缺失或非字符串", is_error=True)
 
-        p = Path(path)
+        abs_path = resolve_path(path)
+        p = Path(abs_path)
         if not p.exists() or p.is_dir():
             return Result(content=f"文件不存在或是目录: {path}", is_error=True)
         try:
@@ -75,4 +77,5 @@ class EditFileTool:
             p.write_text(new_content, encoding="utf-8")
         except OSError as e:
             return Result(content=f"写回失败: {e}", is_error=True)
-        return Result(content=f"已编辑 {path}（替换 1 处）")
+        return Result(content=f"已编辑 {abs_path}（替换 1 处）")
+

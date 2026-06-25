@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from nuocode.tool import Result
+from nuocode.tool.ctx import resolve_path
 
 _MAX_HITS = 100
 _MAX_LINE_LEN = 1024 * 1024  # 1MB；超过此长度的单行标注未完整搜索
@@ -59,7 +60,7 @@ class GrepTool:
 
         path = data.get("path") or "."
         glob_pat = data.get("glob")
-        root = Path(path)
+        root = Path(resolve_path(path))
         if not root.exists():
             return Result(content=f"搜索根目录不存在: {path}", is_error=True)
 

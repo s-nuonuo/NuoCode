@@ -5,9 +5,36 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from nuocode.permission import Mode
+
+# ── chap14: WorktreeAccessor 协议 ────────────────────────────────────────
+
+
+@dataclass
+class WorktreeSummary:
+    """Worktree 摘要信息，用于 /worktree list 输出。"""
+
+    name: str
+    path: str
+    branch: str
+    active: bool
+    manual: bool
+
+
+class WorktreeAccessor(Protocol):
+    """command 包访问 Worktree 管理器的协议（屏蔽 worktree 包反向依赖）。"""
+
+    async def create(self, name: str) -> tuple[str, str]: ...   # (path, branch)
+    def list(self) -> list[WorktreeSummary]: ...
+    async def enter(self, name: str) -> None: ...
+    async def exit(self, action: str, discard: bool) -> bool: ...  # removed
+    async def remove(self, name: str, discard: bool) -> None: ...
+
+
+# ── UI Protocol ────────────────────────────────────────────────────────────
 
 
 @runtime_checkable
@@ -54,6 +81,9 @@ class UI(Protocol):
 
     # chap12: hooks
     def list_hooks(self) -> list[tuple[str, str, str, str]] | None: ...
+
+    # chap14: worktree
+    def worktree_accessor(self) -> WorktreeAccessor | None: ...
 
 
 class NopUI:
@@ -134,5 +164,9 @@ class NopUI:
     def list_hooks(self) -> list[tuple[str, str, str, str]] | None:
         return None
 
+    # chap14 worktree no-op
+    def worktree_accessor(self) -> WorktreeAccessor | None:
+        return None
 
-__all__ = ["NopUI", "UI"]
+
+__all__ = ["NopUI", "UI", "WorktreeAccessor", "WorktreeSummary"]

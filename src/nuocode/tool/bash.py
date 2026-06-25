@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from nuocode.tool import Result, _truncate
+from nuocode.tool.ctx import resolve_path
 
 
 class BashTool:
@@ -47,6 +48,7 @@ class BashTool:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=resolve_path(""),
             )
         except OSError as e:
             return Result(content=f"启动子进程失败: {e}", is_error=True)

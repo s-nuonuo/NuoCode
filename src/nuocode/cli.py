@@ -102,6 +102,14 @@ async def _amain() -> int:
     registry.register(TaskStopTool(task_manager))
     registry.register(SendMessageTool(task_manager))
 
+    # ── chap14: Worktree Manager ──
+    worktree_mgr = None
+    try:
+        from nuocode.worktree.manager import Manager as WorktreeManager
+        worktree_mgr = WorktreeManager(root)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Worktree manager 初始化失败（非 git 仓库？）: %s", e)
+
     # 会话 JSONL 写入器（chap09）
     writer = session_mod.Writer(session_ctx.session_dir)
 
@@ -136,6 +144,7 @@ async def _amain() -> int:
             subagent_catalog=subagent_catalog,
             task_manager=task_manager,
             enable_subagent_background=cfg.enable_subagent_background,
+            worktree_mgr=worktree_mgr,  # chap14
         )
         try:
             await app.run_async()
@@ -150,6 +159,13 @@ async def _amain() -> int:
         except Exception:  # noqa: BLE001
             pass
         await mgr.close()
+        # chap14: sweep_stale（后台异步，不阻塞退出）
+        if worktree_mgr is not None:
+            try:
+                import datetime as _dt2
+                await worktree_mgr.sweep_stale(cutoff=_dt2.timedelta(hours=24))
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 

@@ -26,6 +26,7 @@ from nuocode.tool.filter import (
 if TYPE_CHECKING:
     from nuocode.subagent.catalog import Catalog
     from nuocode.task.manager import Manager as TaskManager
+    from nuocode.worktree.manager import Manager as WorktreeManager
 
 
 # ── 模型别名映射 ──────────────────────────────────────────────────────────────
@@ -58,12 +59,14 @@ class AgentTool:
         task_manager: TaskManager | None = None,
         enable_background: bool = True,
         parent_conv: Any | None = None,  # 父 Conversation（Fork 路径需要）
+        worktree_mgr: WorktreeManager | None = None,  # chap14: Worktree 管理器
     ) -> None:
         self._catalog = catalog
         self._parent_agent = parent_agent
         self._task_manager = task_manager
         self._enable_background = enable_background
         self._parent_conv = parent_conv  # 可选，TUI 侧注入
+        self._worktree_mgr = worktree_mgr  # chap14
 
     # ── Tool 接口 ──────────────────────────────────────────────────────────────
 
@@ -172,6 +175,40 @@ class AgentTool:
                     content=f"[AgentTool] 未知 subagent_type: {subagent_type!r}",
                     is_error=True,
                 )
+
+        # ── chap14: isolation:worktree 分支 ─────────────────────────────
+        if getattr(definition, "isolation", "") == "worktree":
+            if self._worktree_mgr is None:
+                return Result(
+                    content="[AgentTool] worktree manager not configured，无法使用 isolation:worktree",
+                    is_error=True,
+                )
+            # isolation:worktree 时强制走前台（spec F23 最小实现）
+            sub_agent, sub_conv = self._build_sub_agent(
+                definition=definition,
+                is_fork=False,
+                is_background=False,
+            )
+            from nuocode.agent import MaxTurnsReached
+            from nuocode.agent.agent_worktree import _execute_with_worktree
+            try:
+                final_text = await _execute_with_worktree(
+                    manager=self._worktree_mgr,
+                    definition=definition,
+                    sub_agent=sub_agent,
+                    sub_conv=sub_conv,
+                    prompt=prompt,
+                )
+            except MaxTurnsReached as e:
+                final_text = e.final_text
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                return Result(
+                    content=f"[SubAgent:{definition.name}] worktree 执行失败：{e}",
+                    is_error=True,
+                )
+            return Result(content=final_text)
 
         # ── 构建子 Agent ─────────────────────────────────────────────────
         sub_agent, sub_conv = self._build_sub_agent(

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nuocode.tool import Result, _truncate
+from nuocode.tool.ctx import resolve_path
 
 
 class ReadFileTool:
@@ -39,7 +40,8 @@ class ReadFileTool:
         path = data.get("path")
         if not path or not isinstance(path, str):
             return Result(content="参数 path 缺失或非字符串", is_error=True)
-        p = Path(path)
+        abs_path = resolve_path(path)
+        p = Path(abs_path)
         if not p.exists():
             return Result(content=f"文件不存在: {path}", is_error=True)
         if p.is_dir():
@@ -52,3 +54,4 @@ class ReadFileTool:
         numbered = "\n".join(f"{n:6d}\t{line}" for n, line in enumerate(lines, 1))
         out = _truncate(numbered, max_lines=2000, max_chars=256 * 1024)
         return Result(content=out)
+

@@ -1,4 +1,4 @@
-"""builtins 单测：13 条注册 + 关键 handler 行为。"""
+"""builtins 单测：14 条注册 + 关键 handler 行为（chap14 新增 /worktree）。"""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ EXPECTED_NAMES = [
     "session",
     "skill",
     "status",
+    "worktree",
 ]
 
 
@@ -31,7 +32,7 @@ def test_register_builtins_all_registered() -> None:
     reg = Registry()
     register_builtins(reg)
     cmds = reg.visible()
-    assert len(cmds) == 13
+    assert len(cmds) == 14
     assert [c.name for c in cmds] == EXPECTED_NAMES
     for n in EXPECTED_NAMES:
         assert reg.lookup(n) is not None
@@ -134,7 +135,13 @@ def test_register_builtins_handlers_run_on_nop_ui() -> None:
     register_builtins(reg)
     nop = NopUI()
     for cmd in reg.visible():
-        asyncio.run(cmd.handler(nop))
+        # /worktree 需要两个参数 (ui, args)，其他 handler 只需要 (ui,)
+        import inspect
+        sig = inspect.signature(cmd.handler)
+        if len(sig.parameters) >= 2:
+            asyncio.run(cmd.handler(nop, ""))
+        else:
+            asyncio.run(cmd.handler(nop))
 
 
 def test_help_handler_lists_all_12_names() -> None:

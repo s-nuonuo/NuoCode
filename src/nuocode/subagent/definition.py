@@ -60,6 +60,7 @@ class Definition:
     system_prompt: str = ""
     file_path: str = ""
     source: Source = Source.BUILTIN
+    isolation: str = ""  # chap14: "" 或 "worktree"
 
     def is_fork(self) -> bool:
         """判断是否为 Fork 路径用的临时定义（spec F22）。"""

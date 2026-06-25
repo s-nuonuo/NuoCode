@@ -21,6 +21,9 @@ build/
 .nuocode/settings.local.yaml
 # nuocode 会话落盘（chap08：tool-result spill 目录与会话状态）
 .nuocode/sessions/
+# chap14: Git Worktree 隔离目录（动态生成，不入版本库）
+.nuocode/worktrees/
+.nuocode/worktree_session.json
 
 # docs
 docs/

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from nuocode.tool import Result
+from nuocode.tool.ctx import resolve_path
 
 _MAX_RESULTS = 100
 
@@ -53,7 +54,7 @@ class GlobTool:
         if not isinstance(path, str):
             return Result(content="参数 path 必须是字符串", is_error=True)
 
-        root = Path(path)
+        root = Path(resolve_path(path))
         if not root.exists():
             return Result(content=f"搜索根目录不存在: {path}", is_error=True)
 

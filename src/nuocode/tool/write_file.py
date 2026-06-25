@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nuocode.tool import Result
+from nuocode.tool.ctx import resolve_path
 
 
 class WriteFileTool:
@@ -40,10 +41,12 @@ class WriteFileTool:
             return Result(content="参数 path 缺失或非字符串", is_error=True)
         if content is None or not isinstance(content, str):
             return Result(content="参数 content 缺失或非字符串", is_error=True)
-        p = Path(path)
+        abs_path = resolve_path(path)
+        p = Path(abs_path)
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
         except OSError as e:
             return Result(content=f"写入失败: {e}", is_error=True)
-        return Result(content=f"已写入 {path}（{len(content.encode('utf-8'))} 字节）")
+        return Result(content=f"已写入 {abs_path}（{len(content.encode('utf-8'))} 字节）")
+
