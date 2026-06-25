@@ -50,6 +50,8 @@ class ProviderConfig:
 @dataclass
 class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
+    # chap13：是否允许子 Agent 后台执行（N6）
+    enable_subagent_background: bool = True
 
 
 def _require_str(value: Any, where: str) -> str:
@@ -110,7 +112,15 @@ def _from_dict(raw: Any) -> Config:
             )
         )
 
-    return Config(providers=providers)
+    # chap13：enable_subagent_background 解析（N6）
+    enable_bg_raw = raw.get("enable_subagent_background", True)
+    if not isinstance(enable_bg_raw, bool):
+        enable_bg_raw = True
+
+    return Config(
+        providers=providers,
+        enable_subagent_background=enable_bg_raw,
+    )
 
 
 def load(path: str) -> Config:

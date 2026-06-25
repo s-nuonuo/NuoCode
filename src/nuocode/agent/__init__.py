@@ -140,6 +140,14 @@ def _ensure_final(text: str) -> str:
 # ───────── Agent ─────────
 
 
+class MaxTurnsReached(Exception):
+    """子 Agent 触达最大迭代轮数时抛出（chap13）。"""
+
+    def __init__(self, final_text: str = "") -> None:
+        super().__init__(f"max turns reached; last text: {final_text[:80]!r}")
+        self.final_text = final_text
+
+
 class Agent:
     """持有 provider / registry / engine / runtime，执行 ReAct 循环。"""
 
@@ -155,6 +163,13 @@ class Agent:
         instruction_text: str = "",
         memory_text: str = "",
         hook_engine=None,
+        # ── chap13：子 Agent 专属选项 ──
+        system_prompt: str | None = None,
+        max_turns: int = 0,
+        permission_mode: "Mode | None" = None,
+        dont_ask: bool = False,
+        approval_upgrader=None,
+        allowed_tools: list[str] | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -178,6 +193,13 @@ class Agent:
         self._full_registry: Registry | None = None
         # chap12：Hook 引擎（可选）
         self._hook_engine = hook_engine
+        # chap13：子 Agent 专属选项
+        self._system_prompt = system_prompt      # 非空时覆盖默认 nuocode 系统提示
+        self._max_turns = max_turns              # 0 = 用全局 MAX_ITERATIONS
+        self._sub_permission_mode = permission_mode  # None = 用 TUI 运行时模式
+        self._dont_ask = dont_ask                # dontAsk 模式：Ask 决策自动转 Allow
+        self._approval_upgrader = approval_upgrader  # 子 Agent 审批升级回调
+        self._allowed_tools = allowed_tools      # 工具白名单（过滤后传入）
 
     def with_catalog(self, catalog) -> Agent:  # noqa: ANN001
         """chap11：注入 Skill catalog。返回 self 以便链式调用。"""
@@ -273,9 +295,13 @@ class Agent:
                 for s in self._catalog.list()
             ]
             skills_catalog_text = render_skills_catalog(items)
-        sys_prompt = prompt.build_system_prompt(
-            self._instruction_text, self._memory_text, skills_catalog_text
-        )
+        # chap13：子 Agent 若指定 system_prompt 则覆盖默认系统提示
+        if self._system_prompt is not None:
+            sys_prompt = self._system_prompt
+        else:
+            sys_prompt = prompt.build_system_prompt(
+                self._instruction_text, self._memory_text, skills_catalog_text
+            )
         # chap11：active skills 注入动态 env（每轮重建）
         active_block = render_active_skills_block(
             [ActiveSkillEntry(name=e.name, body=e.body) for e in self._runtime.active_skills.snapshot()]
@@ -284,7 +310,14 @@ class Agent:
         if active_block:
             env_text = env_text + "\n\n" + active_block
 
-        if mode == Mode.PLAN:
+        # chap13：子 Agent 允许工具过滤（allowed_tools 白名单）
+        if self._allowed_tools is not None:
+            allowed_set = set(self._allowed_tools)
+            if mode == Mode.PLAN:
+                defs = [d for d in self._registry.read_only_definitions() if d.name in allowed_set]
+            else:
+                defs = [d for d in self._registry.definitions() if d.name in allowed_set]
+        elif mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
             defs = self._registry.definitions()
@@ -764,7 +797,9 @@ class Agent:
 
                 yield Event(tool=ToolEvent(name=calls[i].name, args=preview, phase=Phase.START))
 
-                decision, reason = self._engine.check(mode, calls[i], False)
+                # chap13：子 Agent 若设定了 permission_mode，覆盖入参 mode
+                effective_mode = self._sub_permission_mode if self._sub_permission_mode is not None else mode
+                decision, reason = self._engine.check(effective_mode, calls[i], False)
 
                 if decision == Decision.ALLOW:
                     res = await self._run_one(calls[i])
@@ -776,6 +811,70 @@ class Agent:
                 elif decision == Decision.DENY:
                     results[i] = ToolResult(tool_call_id=calls[i].id, content=reason, is_error=True)
                 else:
+                    # ── chap13：dont_ask 短路 ──
+                    if self._dont_ask:
+                        res = await self._run_one(calls[i])
+                        results[i] = ToolResult(
+                            tool_call_id=calls[i].id,
+                            content=res.content,
+                            is_error=res.is_error,
+                        )
+                        yield Event(
+                            tool=ToolEvent(
+                                name=calls[i].name,
+                                args=preview,
+                                phase=Phase.END,
+                                result=results[i].content,
+                                is_error=results[i].is_error,
+                            )
+                        )
+                        i += 1
+                        continue
+
+                    # ── chap13：approval_upgrader 升级 ──
+                    if self._approval_upgrader is not None:
+                        req_up = ApprovalRequest(
+                            name=calls[i].name,
+                            args=preview,
+                            reason=reason,
+                            respond=asyncio.get_running_loop().create_future(),
+                        )
+                        try:
+                            outcome_up, ok = await self._approval_upgrader(req_up)
+                        except Exception:  # noqa: BLE001
+                            ok = False
+                        if ok:
+                            if outcome_up == Outcome.DENY_ONCE:
+                                results[i] = ToolResult(
+                                    tool_call_id=calls[i].id,
+                                    content=f"用户拒绝此次工具调用：{reason}",
+                                    is_error=True,
+                                )
+                            else:
+                                if outcome_up == Outcome.ALLOW_FOREVER:
+                                    try:
+                                        self._engine.persist_local_allow(calls[i])
+                                    except Exception as e:  # noqa: BLE001
+                                        logger.warning("写入永久放行规则失败: %s", e)
+                                res = await self._run_one(calls[i])
+                                results[i] = ToolResult(
+                                    tool_call_id=calls[i].id,
+                                    content=res.content,
+                                    is_error=res.is_error,
+                                )
+                            yield Event(
+                                tool=ToolEvent(
+                                    name=calls[i].name,
+                                    args=preview,
+                                    phase=Phase.END,
+                                    result=results[i].content,
+                                    is_error=results[i].is_error,
+                                )
+                            )
+                            i += 1
+                            continue
+                        # ok=False：升级失败，走下面的默认路径
+
                     loop = asyncio.get_running_loop()
                     respond: asyncio.Future[Outcome] = loop.create_future()
                     req = ApprovalRequest(
@@ -886,10 +985,165 @@ class Agent:
                 return msgs[i:]
         return msgs[-2:] if len(msgs) >= 2 else msgs
 
+    # ──────────── chap13：run_to_completion ────────────────────────────────
+
+    async def run_to_completion(
+        self,
+        conv: Conversation,
+        task: str,
+        events: asyncio.Queue | None = None,
+    ) -> str:
+        """执行子 Agent 的"跑到底"循环（chap13 spec F9）。
+
+        复用主 ``run`` 的几乎所有逻辑：
+        - 不通过队列返回事件（内部消费），最终返回 final_text
+        - ``max_turns`` 由 ``self._max_turns`` 决定（0 则用 MAX_ITERATIONS）
+        - 不触发 memory update（子 Agent 上下文短，不需要）
+        - 接受可选的 ``events`` 队列，把内部事件转发出去
+
+        Args:
+            conv: 子对话（可能已被 Fork 路径预装填）
+            task: 任务文本；空字符串时不追加 user 消息
+            events: 外部事件队列（TaskManager 与 TUI 借此聚合进度）
+
+        Returns:
+            最后一条 assistant 文本
+
+        Raises:
+            MaxTurnsReached: 触达 max_turns 时
+        """
+        # 1. 追加任务消息（空 task 则跳过，避免 Fork 路径重复追加）
+        if task:
+            conv.add_user(task)
+
+        # 2. 计算最大轮数
+        turns = self._max_turns if self._max_turns > 0 else MAX_ITERATIONS
+
+        # 3. 确定 mode（子 Agent 用 sub_permission_mode 或 DEFAULT）
+        mode = self._sub_permission_mode if self._sub_permission_mode is not None else Mode.DEFAULT
+
+        # 4. 构建系统提示与工具定义（复用 _run_inner 同样的逻辑）
+        env = prompt.gather_environment(self._version, self._provider.model)
+        if self._system_prompt is not None:
+            sys_prompt = self._system_prompt
+        else:
+            sys_prompt = prompt.build_system_prompt(
+                self._instruction_text, self._memory_text, ""
+            )
+        env_text = env.render()
+
+        # 5. 工具定义（allowed_tools 过滤）
+        if self._allowed_tools is not None:
+            allowed_set = set(self._allowed_tools)
+            if mode == Mode.PLAN:
+                defs = [d for d in self._registry.read_only_definitions() if d.name in allowed_set]
+            else:
+                defs = [d for d in self._registry.definitions() if d.name in allowed_set]
+        elif mode == Mode.PLAN:
+            defs = self._registry.read_only_definitions()
+        else:
+            defs = self._registry.definitions()
+
+        self._current_mode = mode
+        self._unknown_run_state[id(conv)] = 0
+
+        cancel = asyncio.Event()  # 子 Agent 不支持外部取消（通过 asyncio.CancelledError）
+        final_text = ""
+
+        for it in range(1, turns + 1):
+            # 转发迭代事件
+            if events is not None:
+                try:
+                    events.put_nowait(Event(iter=it))
+                except asyncio.QueueFull:
+                    pass
+
+            # 上下文管理（AUTO 路径）
+            try:
+                async for _ev in self._run_manage_context(conv, defs, TriggerKind.AUTO):
+                    if events is not None:
+                        try:
+                            events.put_nowait(_ev)
+                        except asyncio.QueueFull:
+                            pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning("sub_agent auto manage_context failed: %s", e)
+
+            reminder = ""  # 子 Agent 不注入 plan reminder
+
+            # 单轮 stream
+            text, calls, _usage, err = "", [], None, None
+            async for ev in self._stream_once_gen(conv, defs, sys_prompt, env_text, reminder, cancel):
+                if ev.err is not None:
+                    err = ev.err
+                    break
+                if ev.text:
+                    text += ev.text
+                if isinstance(getattr(ev, "_calls", None), list):
+                    calls = ev._calls  # type: ignore[attr-defined]
+                if ev.usage is not None:
+                    _usage = ev.usage
+                if events is not None:
+                    try:
+                        events.put_nowait(ev)
+                    except asyncio.QueueFull:
+                        pass
+
+            if err is not None:
+                raise err
+
+            if _usage is not None:
+                self._runtime.usage_anchor = _usage_anchor_sum(_usage)
+                self._runtime.anchor_msg_len = conv.length()
+
+            if not calls:
+                # 模型不再调工具，正常结束
+                final_text = _ensure_final(text)
+                conv.add_assistant(final_text)
+                return final_text
+
+            conv.add_assistant_with_tool_calls(text, calls)
+
+            # 判断是否全部为未知工具
+            if self._all_unknown(calls):
+                self._unknown_run_state[id(conv)] = self._unknown_run_state.get(id(conv), 0) + 1
+            else:
+                self._unknown_run_state[id(conv)] = 0
+
+            if self._unknown_run_state.get(id(conv), 0) >= MAX_UNKNOWN_RUN:
+                final_text = NOTICE_UNKNOWN_TOOLS
+                self._ensure_assistant_tail(conv, final_text)
+                return final_text
+
+            results: list[ToolResult | None] = [None] * len(calls)
+            async for ev in self._execute_batched(calls, mode, cancel, results):
+                if events is not None:
+                    try:
+                        events.put_nowait(ev)
+                    except asyncio.QueueFull:
+                        pass
+
+            for k, c in enumerate(calls):
+                if results[k] is None:
+                    results[k] = ToolResult(
+                        tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True
+                    )
+
+            real_results: list[ToolResult] = [r for r in results if r is not None]
+            conv.add_tool_results(real_results)
+            self._track_file_reads(calls, real_results)
+
+        # 触达 max_turns
+        # 取最后一条 assistant 文本
+        last_texts = [m.content for m in conv.messages() if m.role == "assistant" and m.content]
+        final_text = last_texts[-1] if last_texts else NOTICE_MAX_ITER
+        raise MaxTurnsReached(final_text)
+
 
 __all__ = [
     "MAX_ITERATIONS",
     "MAX_UNKNOWN_RUN",
+    "MaxTurnsReached",
     "PLAN_REMINDER_INTERVAL",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",

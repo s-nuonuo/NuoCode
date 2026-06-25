@@ -133,6 +133,10 @@ class NuoCodeApp(App):
         sessions_dir: str = "",
         catalog=None,
         executor=None,
+        # chap13：SubAgent 扩展
+        subagent_catalog=None,
+        task_manager=None,
+        enable_subagent_background: bool = True,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
@@ -186,6 +190,15 @@ class NuoCodeApp(App):
             register_skills_as_commands(self._cmd_registry, catalog)
         self.completion: CompletionMenu = CompletionMenu()
         self._cwd: str = os.getcwd()
+        # chap13：SubAgent
+        self.subagent_catalog = subagent_catalog
+        self.task_manager = task_manager
+        self.enable_subagent_background = enable_subagent_background
+        # chap13：后台任务 done 通知队列（由 _on_task_done 消费）
+        if task_manager is not None:
+            self._task_done_queue = task_manager.subscribe_done()
+        else:
+            self._task_done_queue = None
 
     # ───────── compose ─────────
 
@@ -214,6 +227,9 @@ class NuoCodeApp(App):
             self._enter_selecting()
         # chap12: emit SessionStart
         asyncio.create_task(self._emit_session_start())
+        # chap13：启动后台任务 done 通知监听
+        if self._task_done_queue is not None:
+            asyncio.create_task(self._watch_task_done())
 
     # ───────── state transitions ─────────
 
@@ -241,6 +257,32 @@ class NuoCodeApp(App):
         self.query_one("#statusbar", Static).update("请使用方向键选择一个 provider，按 Enter 确认")
         self.query_one("#select", OptionList).focus()
 
+    async def _watch_task_done(self) -> None:
+        """chap13 F19：监听后台任务完成，注入 <task-notification> 到下次 reminder。"""
+        if self._task_done_queue is None:
+            return
+        while True:
+            try:
+                task_id = await self._task_done_queue.get()
+            except asyncio.CancelledError:
+                break
+            if self.task_manager is None:
+                continue
+            bg = self.task_manager.get(task_id)
+            if bg is None:
+                continue
+            name_str = f'name="{bg.name}"' if bg.name else f'id="{task_id}"'
+            status_str = bg.status
+            result_str = (bg.result or "")[:500]
+            notification = (
+                f"<task-notification>\n"
+                f"Task {task_id} ({name_str}): {status_str}\n"
+                f"Result: {result_str}\n"
+                f"</task-notification>"
+            )
+            if self.runtime is not None:
+                self.runtime.append_reminders([notification])
+
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
@@ -257,6 +299,17 @@ class NuoCodeApp(App):
         )
         if self.catalog is not None:
             self.agent.with_catalog(self.catalog)
+        # chap13：注册 AgentTool（如有 subagent_catalog）
+        if self.subagent_catalog is not None:
+            from nuocode.agent.agent_tool import AgentTool
+            agent_tool = AgentTool(
+                catalog=self.subagent_catalog,
+                parent_agent=self.agent,
+                task_manager=self.task_manager,
+                enable_background=self.enable_subagent_background,
+                parent_conv=self.conv,
+            )
+            self.registry.register(agent_tool)
         # 将 model 名推送给 writer，以便首条消息带 model 字段
         if self.writer is not None:
             self.writer.set_model(cfg.model)
@@ -350,7 +403,7 @@ class NuoCodeApp(App):
                 if result.blocked:
                     log.write(f"● [hook 拦截] {result.blocking_hook_name}: {result.reason}")
                     return  # 不 start_turn
-            except Exception as e:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 pass  # hook 失败不影响主流程
         self.conv.add_user(text)
         self._start_turn()

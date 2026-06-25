@@ -89,6 +89,19 @@ async def _amain() -> int:
     runtime = SessionRuntime(session=session_ctx, active_skills=active_skills, hook_engine=hook_engine)
     sessions_dir = str(Path(root) / ".nuocode" / "sessions")
 
+    # ── chap13: SubAgent Catalog + Task Manager ──
+    from nuocode.subagent.catalog import load_catalog as load_subagent_catalog
+    from nuocode.task import Manager as TaskManager
+    from nuocode.task.tools import SendMessageTool, TaskGetTool, TaskListTool, TaskStopTool
+
+    subagent_catalog = load_subagent_catalog(root)
+    task_manager = TaskManager()
+    # 注册后台任务工具
+    registry.register(TaskListTool(task_manager))
+    registry.register(TaskGetTool(task_manager))
+    registry.register(TaskStopTool(task_manager))
+    registry.register(SendMessageTool(task_manager))
+
     # 会话 JSONL 写入器（chap09）
     writer = session_mod.Writer(session_ctx.session_dir)
 
@@ -120,6 +133,9 @@ async def _amain() -> int:
             sessions_dir=sessions_dir,
             catalog=catalog,
             executor=executor,
+            subagent_catalog=subagent_catalog,
+            task_manager=task_manager,
+            enable_subagent_background=cfg.enable_subagent_background,
         )
         try:
             await app.run_async()

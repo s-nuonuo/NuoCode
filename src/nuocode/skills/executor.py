@@ -74,9 +74,7 @@ class Executor:
             return
 
         # 构造 fork 子 Agent 的 messages：根据 fork_context 截取
-        from nuocode.agent import Agent
-        from nuocode.agent.runtime import SessionRuntime
-        from nuocode.compact import new_session_context
+        from nuocode.agent.launch import launch_fork
         from nuocode.conversation import Conversation
 
         fc = sk.meta.fork_context
@@ -92,53 +90,39 @@ class Executor:
             )
             sub_msgs = list(msgs)
 
-        sub_conv = Conversation()
-        sub_conv.replace_messages(sub_msgs)
-        sub_conv.add_user(body)
+        # 用 launch_fork 公共路径（chap13 F33）
+        # 构造临时父 Agent 代理，仅用于传递 provider/registry/engine/version
 
-        # 子 Agent 工具白名单 + 系统工具
-        from nuocode.tool import Registry as _R
+        class _ParentProxy:
+            """临时父 Agent 代理。"""
+            def __init__(self) -> None:
+                self._provider = provider
+                self._registry = registry
+                self._version = version
+                self._engine = engine
+                self._context_window = 200_000
 
-        sub_reg = _R()
-        for tname in sk.meta.allowed_tools:
-            t = registry.get(tname)
-            if t is not None:
-                # 直接复用工具实例（线程/异步安全前提下）
-                sub_reg.register_skill_tool(t)
-        # 系统工具：load_skill/install_skill 一并继承
-        for n in registry.names():
-            if registry.is_system(n):
-                sub_reg.register_skill_tool(registry.get(n))
+        proxy = _ParentProxy()
 
-        import tempfile
-
-        sub_runtime = SessionRuntime(session=new_session_context(tempfile.gettempdir()))
-        sub_agent = Agent(
-            provider=provider,
-            registry=sub_reg,
-            version=version,
-            engine=engine,
-            runtime=sub_runtime,
-            instruction_text="",
-            memory_text="",
-        )
-        sub_agent.with_catalog(self._catalog)
+        # 构造截断后的 conv
+        parent_conv_fork = Conversation()
+        parent_conv_fork.replace_messages(sub_msgs)
 
         yield ExecuteEvent(kind="fork_started", text=sk.meta.name)
-        final_text_parts: list[str] = []
         try:
-            async for ev in sub_agent.run(sub_conv):
-                if ev.text:
-                    final_text_parts.append(ev.text)
-                if ev.done:
-                    break
+            final_text = await launch_fork(
+                parent_agent=proxy,
+                parent_conv=parent_conv_fork,
+                task=body,
+                allowed_tools=sk.meta.allowed_tools or None,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             yield ExecuteEvent(kind="error", text=f"fork skill error: {e}")
             return
         yield ExecuteEvent(
-            kind="fork_done", text=sk.meta.name, body="".join(final_text_parts)
+            kind="fork_done", text=sk.meta.name, body=final_text
         )
 
 
