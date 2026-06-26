@@ -24,6 +24,7 @@ from nuocode.tool.filter import (
 )
 
 if TYPE_CHECKING:
+    from nuocode.agent.team_hook import TeamHook
     from nuocode.subagent.catalog import Catalog
     from nuocode.task.manager import Manager as TaskManager
     from nuocode.worktree.manager import Manager as WorktreeManager
@@ -60,6 +61,7 @@ class AgentTool:
         enable_background: bool = True,
         parent_conv: Any | None = None,  # 父 Conversation（Fork 路径需要）
         worktree_mgr: WorktreeManager | None = None,  # chap14: Worktree 管理器
+        team_hook: "TeamHook | None" = None,          # chap15: Team hook
     ) -> None:
         self._catalog = catalog
         self._parent_agent = parent_agent
@@ -67,6 +69,7 @@ class AgentTool:
         self._enable_background = enable_background
         self._parent_conv = parent_conv  # 可选，TUI 侧注入
         self._worktree_mgr = worktree_mgr  # chap14
+        self._team_hook = team_hook  # chap15
 
     # ── Tool 接口 ──────────────────────────────────────────────────────────────
 
@@ -79,6 +82,7 @@ class AgentTool:
             "- 定义式：指定 subagent_type 选择预定义角色（Explore/Plan/general-purpose 等）\n"
             "- Fork 式：不指定 subagent_type，克隆当前对话上下文独立完成任务\n"
             "Fork 子 Agent 强制后台执行，不阻塞主对话。\n"
+            "- Team 模式：指定 team_name，将该 Agent 作为 Team 队员启动（chap15）\n"
             "可用角色列表: " + ", ".join(self._catalog.names())
         )
 
@@ -111,6 +115,14 @@ class AgentTool:
                     "type": "string",
                     "description": "给本次任务命名（可选），用于 SendMessage 定位",
                 },
+                "team_name": {
+                    "type": "string",
+                    "description": "Team 名称（可选），非空时将该 Agent 作为 Team 队员启动（chap15）",
+                },
+                "plan_mode_required": {
+                    "type": "boolean",
+                    "description": "是否要求队员以 plan 模式起步（可选，仅 Team 模式有效）",
+                },
             },
             "required": ["prompt", "description"],
         }
@@ -130,9 +142,37 @@ class AgentTool:
         subagent_type: str | None = params.get("subagent_type") or None
         run_in_background: bool = bool(params.get("run_in_background", False))
         task_name: str | None = params.get("name") or None
+        team_name: str = params.get("team_name") or ""
+        plan_mode_required: bool = bool(params.get("plan_mode_required", False))
 
         if not prompt:
             return Result(content="[AgentTool] prompt 不能为空", is_error=True)
+
+        # ── chap15: Team spawn 分支 ───────────────────────────────────────
+        if team_name:
+            if self._team_hook is None:
+                return Result(
+                    content="[AgentTool] team_hook 未配置，无法使用 Team 功能",
+                    is_error=True,
+                )
+            from nuocode.agent.team_hook import TeamSpawnRequest
+            team_req = TeamSpawnRequest(
+                team_name=team_name,
+                member_name=task_name or "",
+                subagent_type=subagent_type or "general-purpose",
+                model=params.get("model") or "",
+                prompt=prompt,
+                description=params.get("description") or "",
+                plan_mode_required=plan_mode_required,
+            )
+            try:
+                result_text = await self._team_hook.spawn_teammate(team_req)
+                return Result(content=result_text)
+            except Exception as e:  # noqa: BLE001
+                return Result(
+                    content=f"[AgentTool] Team spawn 失败: {e}",
+                    is_error=True,
+                )
 
         is_fork = subagent_type is None
 

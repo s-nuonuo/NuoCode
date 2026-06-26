@@ -110,6 +110,49 @@ async def _amain() -> int:
     except Exception as e:  # noqa: BLE001
         logger.warning("Worktree manager 初始化失败（非 git 仓库？）: %s", e)
 
+    # ── chap15: AgentNameRegistry + Team Manager + Coordinator ──
+    from nuocode.team.manager import Manager as TeamManager
+    from nuocode.team.registry import AgentNameRegistry
+
+    name_reg = AgentNameRegistry()
+    task_manager.set_name_registry(name_reg)
+
+    team_mgr = TeamManager(
+        home_dir=Path.home(),
+        project_root=Path(root),
+        wt_mgr=worktree_mgr,
+        task_mgr=task_manager,
+        registry=name_reg,
+    )
+
+    # 注册 7 个 team 工具
+    from nuocode.team.tools import (
+        SendMessageTool as TeamSendMessageTool,
+    )
+    from nuocode.team.tools import (
+        TaskCreateTool,
+        TaskUpdateTool,
+        TeamCreateTool,
+        TeamDeleteTool,
+    )
+    from nuocode.team.tools import (
+        TaskGetTool as TeamTaskGetTool,
+    )
+    from nuocode.team.tools import (
+        TaskListTool as TeamTaskListTool,
+    )
+    registry.register(TeamCreateTool(team_mgr))
+    registry.register(TeamDeleteTool(team_mgr))
+    registry.register(TaskCreateTool(team_mgr))
+    registry.register(TeamTaskGetTool(team_mgr))
+    registry.register(TeamTaskListTool(team_mgr))
+    registry.register(TaskUpdateTool(team_mgr))
+    registry.register(TeamSendMessageTool(team_mgr))
+
+    # Coordinator Mode 检测
+    import nuocode.coordinator as coordinator_mod
+    coordinator_enabled = coordinator_mod.is_enabled(cfg)
+
     # 会话 JSONL 写入器（chap09）
     writer = session_mod.Writer(session_ctx.session_dir)
 
@@ -145,6 +188,8 @@ async def _amain() -> int:
             task_manager=task_manager,
             enable_subagent_background=cfg.enable_subagent_background,
             worktree_mgr=worktree_mgr,  # chap14
+            team_mgr=team_mgr,          # chap15
+            coordinator_enabled=coordinator_enabled,  # chap15
         )
         try:
             await app.run_async()
@@ -164,6 +209,12 @@ async def _amain() -> int:
             try:
                 import datetime as _dt2
                 await worktree_mgr.sweep_stale(cutoff=_dt2.timedelta(hours=24))
+            except Exception:  # noqa: BLE001
+                pass
+        # chap15: team manager cleanup（非阻塞）
+        if team_mgr is not None:
+            try:
+                pass  # team_mgr 无显式 close，持久化在操作时完成
             except Exception:  # noqa: BLE001
                 pass
     return 0

@@ -1,4 +1,4 @@
-"""工具过滤多层防线（chap13）。
+"""工具过滤多层防线（chap13 + chap15）。
 
 定义子 Agent 工具列表过滤的常量与逻辑，对应 spec F26-F30。
 
@@ -9,6 +9,7 @@
 4. 若后台模式，与 ``ASYNC_AGENT_ALLOWED_TOOLS`` + MCP/Skill 工具命名约定取交集
 5. 应用定义层 ``disallowed_tools`` 黑名单
 6. 若 ``allowed`` 白名单非空，与之取交集
+7. 若 ``teammate=True``，注入 ``TEAMMATE_EXTRA_TOOLS``（chap15 T17）
 """
 
 from __future__ import annotations
@@ -35,6 +36,16 @@ ASYNC_AGENT_ALLOWED_TOOLS: list[str] = [
     "bash",
     "load_skill",
     "install_skill",
+]
+
+# 队员专属协作工具白名单（chap15 F6/N2）。
+# 主 Agent 与普通 SubAgent 看不到这些工具，队员通过 teammate=True 获得。
+TEAMMATE_EXTRA_TOOLS: list[str] = [
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "SendMessage",
 ]
 
 
@@ -69,11 +80,14 @@ class FilterParams:
     disallowed: list[str] = field(default_factory=list)
     """Agent 定义层 disallowedTools 黑名单。"""
 
+    teammate: bool = False
+    """是否为 Team 队员（chap15 T17）。True 时注入 TEAMMATE_EXTRA_TOOLS。"""
+
 
 # ── 核心过滤函数 ─────────────────────────────────────────────────────────────
 
 def apply_agent_tool_filter(p: FilterParams) -> list[str]:
-    """按 spec F30 顺序应用五层过滤，返回最终 allowed 工具名列表。
+    """按 spec F30 顺序应用过滤，返回最终 allowed 工具名列表。
 
     过滤顺序：
     1. 起点 = p.all 副本
@@ -82,6 +96,7 @@ def apply_agent_tool_filter(p: FilterParams) -> list[str]:
     4. 若 p.background，与 ASYNC_AGENT_ALLOWED_TOOLS + MCP/Skill 命名约定取交集
     5. 去掉 p.disallowed
     6. 若 p.allowed 非空，与之取交集
+    7. 若 p.teammate=True，追加 TEAMMATE_EXTRA_TOOLS（不受前面过滤限制）
     """
     result = list(p.all)
 
@@ -108,5 +123,17 @@ def apply_agent_tool_filter(p: FilterParams) -> list[str]:
     if p.allowed:
         def_allowed_set = set(p.allowed)
         result = [t for t in result if t in def_allowed_set]
+
+    # 步骤 6（chap15 T17）：队员模式注入协作工具
+    if p.teammate:
+        result_set = set(result)
+        for tool in TEAMMATE_EXTRA_TOOLS:
+            if tool not in result_set:
+                result.append(tool)
+
+    # 无论 teammate 如何，非 teammate 时确保不含协作工具
+    if not p.teammate:
+        teammate_set = set(TEAMMATE_EXTRA_TOOLS)
+        result = [t for t in result if t not in teammate_set]
 
     return result

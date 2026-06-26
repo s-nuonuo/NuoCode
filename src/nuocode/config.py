@@ -30,6 +30,14 @@ class ConfigError(Exception):
 
 
 @dataclass
+class FeaturesConfig:
+    """功能 feature flags（chap15 T25）。"""
+
+    coordinator_mode: bool = False
+    fork_teammate: bool = False
+
+
+@dataclass
 class ProviderConfig:
     name: str
     protocol: Protocol
@@ -52,6 +60,8 @@ class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
     # chap13：是否允许子 Agent 后台执行（N6）
     enable_subagent_background: bool = True
+    # chap15：功能 feature flags
+    features: FeaturesConfig = field(default_factory=FeaturesConfig)
 
 
 def _require_str(value: Any, where: str) -> str:
@@ -117,9 +127,20 @@ def _from_dict(raw: Any) -> Config:
     if not isinstance(enable_bg_raw, bool):
         enable_bg_raw = True
 
+    # chap15：features 解析（T25）
+    features_raw = raw.get("features", {})
+    if isinstance(features_raw, dict):
+        features = FeaturesConfig(
+            coordinator_mode=bool(features_raw.get("coordinator_mode", False)),
+            fork_teammate=bool(features_raw.get("fork_teammate", False)),
+        )
+    else:
+        features = FeaturesConfig()
+
     return Config(
         providers=providers,
         enable_subagent_background=enable_bg_raw,
+        features=features,
     )
 
 

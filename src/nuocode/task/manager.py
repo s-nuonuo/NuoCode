@@ -18,10 +18,10 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
-    pass
+    from nuocode.team.registry import AgentNameRegistry
 
 # 任务状态常量
 STATUS_RUNNING = "running"
@@ -68,8 +68,10 @@ class Manager:
 
     def __init__(self) -> None:
         self._tasks: dict[str, BackgroundTask] = {}
-        self._by_name: dict[str, str] = {}       # name → task_id（弱引用）
+        self._by_name: dict[str, str] = {}       # name → task_id（弱引用，兜底）
         self._done_queues: list[asyncio.Queue[str]] = []
+        self._done_callbacks: list[Callable[[str], Awaitable[None]]] = []  # chap15 T21
+        self._name_reg: "AgentNameRegistry | None" = None  # chap15 T21
 
     # ── 主要接口 ──────────────────────────────────────────────────────────────
 
@@ -95,6 +97,9 @@ class Manager:
         self._tasks[task_id] = bg
         if name:
             self._by_name[name] = task_id
+            # chap15: 同步到 AgentNameRegistry
+            if self._name_reg is not None:
+                self._name_reg.register(name, task_id)
 
         bg.asyncio_task = asyncio.create_task(
             self._run_bg(bg), name=f"bg-task-{task_id}"
@@ -137,6 +142,18 @@ class Manager:
         q: asyncio.Queue[str] = asyncio.Queue()
         self._done_queues.append(q)
         return q
+
+    def on_task_done(self, fn: Callable[[str], Awaitable[None]]) -> None:
+        """注册任务完成回调（chap15 T21）。
+
+        任务完成时（无论成功/失败/取消），逐个 await 调用注册的回调。
+        可注册多个。
+        """
+        self._done_callbacks.append(fn)
+
+    def set_name_registry(self, reg: "AgentNameRegistry") -> None:
+        """设置 AgentNameRegistry（chap15 T21）。"""
+        self._name_reg = reg
 
     async def adopt_running(
         self,
@@ -234,7 +251,7 @@ class Manager:
             await self._notify_done(bg.id)
 
     async def _notify_done(self, task_id: str) -> None:
-        """向所有 subscriber 推送 task_id。"""
+        """向所有 subscriber 推送 task_id，并调用 on_task_done 回调（chap15 T21）。"""
         dead: list[asyncio.Queue] = []
         for q in self._done_queues:
             try:
@@ -247,6 +264,14 @@ class Manager:
                 self._done_queues.remove(q)
             except ValueError:
                 pass
+
+        # 调用 on_task_done 回调（chap15 T21）
+        for callback in list(self._done_callbacks):
+            try:
+                await callback(task_id)
+            except Exception as e:  # noqa: BLE001
+                import sys
+                print(f"[task] on_task_done 回调出错: {e}", file=sys.stderr)
 
 
 def _new_id() -> str:

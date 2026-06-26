@@ -139,6 +139,9 @@ class NuoCodeApp(App):
         enable_subagent_background: bool = True,
         # chap14：Worktree 扩展
         worktree_mgr=None,
+        # chap15：Team 扩展
+        team_mgr=None,
+        coordinator_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.providers: list[ProviderConfig] = providers
@@ -204,6 +207,9 @@ class NuoCodeApp(App):
         # chap14：Worktree
         self.worktree_mgr = worktree_mgr  # Manager | None
         self.active_cwd: str = self._cwd  # 当前生效 cwd（进入 Worktree 后更新）
+        # chap15：Team
+        self.team_mgr = team_mgr  # team.Manager | None
+        self.coordinator_enabled = coordinator_enabled
 
     # ───────── compose ─────────
 
@@ -235,6 +241,11 @@ class NuoCodeApp(App):
         # chap13：启动后台任务 done 通知监听
         if self._task_done_queue is not None:
             asyncio.create_task(self._watch_task_done())
+        # chap15：注册 /team 命令 + 启动 Lead 邮箱轮询
+        if self.team_mgr is not None:
+            from nuocode.command.builtin_team import register_team_commands
+            register_team_commands(self._cmd_registry, self.team_mgr)
+            asyncio.create_task(self._poll_lead_mailboxes())
 
     # ───────── state transitions ─────────
 
@@ -288,6 +299,37 @@ class NuoCodeApp(App):
             if self.runtime is not None:
                 self.runtime.append_reminders([notification])
 
+    async def _poll_lead_mailboxes(self) -> None:
+        """chap15 T30：每秒轮询 Lead 邮箱，收到消息注入 <team-update> reminder（F57）。"""
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+                if self.team_mgr is None:
+                    continue
+                updates = await self.team_mgr.poll_lead_mailboxes()
+                if updates:
+                    lines = ["<team-update>", f"收到 {len(updates)} 条来自队员的消息:"]
+                    for u in updates:
+                        lines.append(f"  [{u.from_}→{u.to}] {u.summary}")
+                    lines.append("</team-update>")
+                    reminder = "\n".join(lines)
+                    if self.runtime is not None:
+                        self.runtime.append_reminders([reminder])
+                    # F58：Lead 空闲时自动唤醒（begin_autonomous_turn）
+                    if self.state is SessionState.IDLE and self.agent is not None:
+                        self._begin_autonomous_turn(reminder)
+            except asyncio.CancelledError:
+                break
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _begin_autonomous_turn(self, reminder: str) -> None:
+        """Lead 空闲时自动唤醒（F58）。"""
+        if self.conv is None or self.agent is None:
+            return
+        self.conv.add_user(reminder)
+        self._start_turn()
+
     def _activate_provider(self, index: int) -> None:
         cfg = self.providers[index]
         self.provider = new_provider(cfg)
@@ -307,6 +349,29 @@ class NuoCodeApp(App):
         # chap13：注册 AgentTool（如有 subagent_catalog）
         if self.subagent_catalog is not None:
             from nuocode.agent.agent_tool import AgentTool
+
+            # chap15：构造 TeamHook（实际委托 team.spawn.spawn_teammate）
+            team_hook = None
+            if self.team_mgr is not None:
+                from nuocode.team.spawn import spawn_teammate as _spawn_fn
+
+                class _TeamHookImpl:
+                    def __init__(self, mgr) -> None:
+                        self._mgr = mgr
+
+                    async def spawn_teammate(self, req):
+                        return await _spawn_fn(self._mgr, req)
+
+                    def is_teammate_context(self, ctx):
+                        if isinstance(ctx, dict):
+                            from nuocode.agent.team_hook import teammate_context_from_ctx
+                            tc = teammate_context_from_ctx(ctx)
+                            if tc is not None:
+                                return tc.team_name, tc.member_name, tc.backend_type == "in-process"
+                        return "", "", False
+
+                team_hook = _TeamHookImpl(self.team_mgr)
+
             agent_tool = AgentTool(
                 catalog=self.subagent_catalog,
                 parent_agent=self.agent,
@@ -314,8 +379,17 @@ class NuoCodeApp(App):
                 enable_background=self.enable_subagent_background,
                 parent_conv=self.conv,
                 worktree_mgr=self.worktree_mgr,  # chap14
+                team_hook=team_hook,              # chap15
             )
             self.registry.register(agent_tool)
+
+        # chap15：Coordinator Mode 系统提示词注入
+        if self.coordinator_enabled and self.agent is not None:
+            import nuocode.coordinator as coord_mod
+            coord_suffix = coord_mod.system_prompt_suffix()
+            # 注入到 runtime reminders（TUI 首轮会消费）
+            if self.runtime is not None:
+                self.runtime.append_reminders([coord_suffix])
         # 将 model 名推送给 writer，以便首条消息带 model 字段
         if self.writer is not None:
             self.writer.set_model(cfg.model)
